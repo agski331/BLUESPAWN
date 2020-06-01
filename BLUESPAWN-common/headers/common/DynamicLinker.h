@@ -1,7 +1,6 @@
 #pragma once
 
-#include <Windows.h>
-#include <winternl.h>
+#include <dlfcn.h>
 
 #include <vector>
 #include <functional>
@@ -12,5 +11,5 @@
 
 #define LINK_FUNCTION(name, dll)                                                                        \
     namespace Linker {                                                                                  \
-        name##_type name## = reinterpret_cast<name##_type>(GetProcAddress(LoadLibraryW(L#dll), #name)); \
+        name##_type name## = reinterpret_cast<name##_type>(dlsym(dlopen(L#dll, RTLD_LAZY), #name)); \
     }

@@ -16,15 +16,6 @@ std::vector<LPCSTR> Scope::GetScopedFileNames() const {
 bool Scope::RegistryKeyIsInScope(LPCSTR pid) const {
 	return true;
 }
-bool Scope::RegistryKeyIsInScope(HKEY key) const {
-	return true;
-}
-std::vector<HKEY> Scope::GetScopedKHEYs() const {
-	return std::vector<HKEY>();
-}
-std::vector<LPCSTR> Scope::GetScopedRegKeyNames() const {
-	return std::vector<LPCSTR>();
-}
 
 bool Scope::ProcessIsInScope(DWORD sProcessName) const {
 	return true;

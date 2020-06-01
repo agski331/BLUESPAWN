@@ -1,5 +1,4 @@
 #pragma once
-#include <Windows.h>
 
 #include "../Hunt.h"
 #include "reaction/Reaction.h"

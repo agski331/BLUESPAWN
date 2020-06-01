@@ -1,7 +1,5 @@
 #pragma once
 
-#include <Windows.h>
-
 #include <string>
 #include <vector>
 #include <optional>
@@ -11,22 +9,12 @@
 #include "common/wrappers.hpp"
 #include "util/permissions/permissions.h"
 #include "common/DynamicLinker.h"
+#include "util/linuxcompat.h"
+
+#include <dirent.h>
 
 #define BUFSIZE 1024
 #define MD5LEN  16
-
-DEFINE_FUNCTION(NTSTATUS, NtCreateFile, __kernel_entry NTAPI,
-				PHANDLE            FileHandle,
-				ACCESS_MASK        DesiredAccess,
-				POBJECT_ATTRIBUTES ObjectAttributes,
-				PIO_STATUS_BLOCK   IoStatusBlock,
-				PLARGE_INTEGER     AllocationSize,
-				ULONG              FileAttributes,
-				ULONG              ShareAccess,
-				ULONG              CreateDisposition,
-				ULONG              CreateOptions,
-				PVOID              EaBuffer,
-				ULONG              EaLength);
 
 #define SHA1LEN 20
 #define SHA256LEN 32
@@ -37,35 +25,177 @@ enum class HashType {
 	SHA256_HASH
 };
 
-namespace FileSystem {
+//TODO: Make sure all files are closed, or delete is called.
+//NOTES: Linux filesystem api v1, in next iteration use fds when getting files from dirs
+namespace FileSystem {	
 	/**
 	* Function to check if a file path is valid
 	*
-	* @param path A wstring containing the path to check
+	* @param path A string containing the path to check
 	* 
 	* @return true if the path points to a valid file, false otherwise
 	*/
-	bool CheckFileExists(const std::wstring& path);
+	bool CheckFileExists(const std::string& path);
 
 	/**
 	* Function to find a file named name.exe in a registry dependent search path
 	*
-	* @param name A wstring containing the name of the file for which to search
+	* @param name A string containing the name of the file for which to search
 	* 
-	* @return A wstring containing the full path to the file if found, or std::nullopt
+	* @return A string containing the full path to the file if found, or std::nullopt
 	*	if the file wasn't found. 
 	*/
-	std::optional<std::wstring> SearchPathExecutable(const std::wstring& name);
+	std::optional<std::string> SearchPathExecutable(const std::string& name);
 	
 	struct FileAttribs {
-		std::wstring extension;
+		std::string extension;
 	};
 
 	struct FileSearchAttribs {
-		std::vector<std::wstring> extensions;
+		std::vector<std::string> extensions;
 	};
 
-	class File : public Loggable {
+		/**
+	 * Represents a file or directory
+	 */
+	class FileObject{
+	protected:
+	    //The file descriptor of the directory or file
+	    int hFile;
+
+		//Does the file object exist as far as we know?
+		bool bFileExists;
+
+		//Path of file
+		std::string FilePath;
+
+		/**
+		 * helper function to check for masks on a file
+		 * @return true if the user would be able to access the file with one of the three masks provided
+		 */ 
+		bool HasPermHelper(const Permissions::Owner &user, DWORD userMask, DWORD groupMask, DWORD otherMask);
+
+	public:
+
+	    /**
+		 * Destructor - closes the file object
+		 */ 
+	    ~FileObject();
+
+	    /**
+		 * @return can the user execute file
+		 */
+	    bool CanExecute(const Permissions::Owner &user);
+
+		/**
+		 * @return can the file be read by user
+		 */ 
+		bool CanRead(const Permissions::Owner &user);
+
+		/**
+		 *@return can the file be written to by user
+		 */ 
+		bool CanWrite(const Permissions::Owner &user);
+
+		/**
+		 * @return can the file be deleted by user
+		 */ 
+		virtual bool CanDelete(const Permissions::Owner &user);
+
+		/**
+		 * @return the file path
+		 */ 
+		std::string GetFilePath() const;
+
+		/**
+		 *@return the file descriptor
+		 */ 
+		int GetFileDescriptor() const;
+
+		/**
+		 * @return bFileExists
+		 */  
+		bool GetFileExists() const;
+
+		/**
+		 * Set the owner of a file
+		 * if the owner is a user, it will set the group owner as well.
+		 * @return true if worked, false otherwise
+		 */ 
+		bool SetFileOwner(const Permissions::Owner& owner);
+
+		/*
+		 * Set the user and group owner to the bluespawn process
+		 * @return true if successful, false otherwise
+		 */ 
+		bool TakeOwnership();
+
+		/**
+		 * Get the permissions for all users on the file 
+		 * @return nullopt if unable to stat the file (execute permissions on parent dir) or the ACCESS_MASK (stat.st_mode)
+		 */ 
+		std::optional<ACCESS_MASK> GetPermissions() const;
+
+		std::optional<Permissions::Owner> GetFileOwner(const Permissions::OwnerType type) const;
+
+	    /**
+		* Function to get the creation time of the file
+		*
+		* @return a FILETIME struct containing the creation time of the file. If an error,
+		*     occurs the function returns std::nullopt and calls SetLastError with the error
+		*/
+		std::optional<FILETIME> GetCreationTime() const;
+
+		/**
+		* Function to get the last modified time of the file
+		*
+		* @return a FILETIME struct containing the last modified time of the file. If an error,
+		*     occurs the function returns std::nullopt and calls SetLastError with the error
+		*/
+		std::optional<FILETIME> GetModifiedTime() const;
+
+		/**
+		* Function to get the last access time of the file
+		*
+		* @return a FILETIME struct containing the last access time of the file. If an error,
+		*     occurs the function returns std::nullopt and calls SetLastError with the error
+		*/
+		std::optional<FILETIME> GetAccessTime() const;
+
+		/**
+		* Function to grant certain permissions to certain user or group
+		*
+		* @param owner The user or group to grant permissions to
+		* @param amAccess The access to grant to owner
+		*
+		* @return true if the permissions were granted, false otherwise
+		*/
+		bool GrantPermissions(const ACCESS_MASK amAccess);
+
+		/**
+		* Function to deny certain permissions to certain user or group
+		*
+		* @param owner The user or group to deny permissions to
+		* @param amAccess The access to deny the owner
+		*
+		* @return true if the permissions were denied, false otherwise
+		*/
+		bool DenyPermissions(const ACCESS_MASK amAccess);
+
+		/**
+		 * Close the file object
+		 */ 
+		virtual void Close();
+
+		/**
+		 * NOTE: the only time this will return nullopt is if the path is "/"
+		 *@return the directory the file is in
+		 */ 
+		std::optional<Folder> GetDirectory() const;
+
+	};
+
+	class File : public Loggable, public FileObject{
 
 		//Whether or not this current file actually exists on the filesystem
 		bool bFileExists; 
@@ -76,24 +206,9 @@ namespace FileSystem {
 		//Whether or not the program has read access to the file
 		bool bReadAccess;
 
-		//Path to the file
-		std::wstring FilePath;
-
-		//Handle for the file
-		HandleWrapper hFile;
-
 		//Attributes of the file
 		FileAttribs Attribs;
 
-		/**
-		* Function to get offsets in format needed by SetFilePointer
-		*
-		* @param val - value to be translated. Upper bit will be ignored
-		* @param lowerVal - variable to store lower value
-		* @param upperVal - variable to store upper value
-		* @param upper - variable to store pointer to upper value
-		*/
-		DWORD SetFilePointer(DWORD64 dwFilePointer) const;
 
 		/**
 		* Function to check if a file is signed in the system catalogs
@@ -107,10 +222,12 @@ namespace FileSystem {
 		* 
 		* @param HashType
 		*
-		* return std::wstring value of the requested hash type
+		* return std::string value of the requested hash type
 		*/
-		std::optional<std::wstring> CalculateHashType(HashType sHashType) const;
+		std::optional<std::string> CalculateHashType(HashType sHashType) const;
+
 	public:
+	//TODO: Support file attribute flags?
 
 		/**
 		* Creates a file object with a given path
@@ -118,16 +235,19 @@ namespace FileSystem {
 		* 
 		* @param path The path to the file to be opened
 		*/
-		File(IN const std::wstring& path);
+		File(const std::string& path);
 
-		/*Getter for the FilePath field*/
-		std::wstring GetFilePath() const;
+		/**
+		 * Creates a file object using a dir file descriptor and a path for after dir
+		 * If the file exists, a handle is opened
+		 * 
+		 * Just prototyped this out for now, planning on adding it to some of the Folder funcs
+		 * NOTE: seems like fcntl doesnt have F_GETNAME, need to search for workaround before implementing
+		 */
+		File(const int dirfd, const std::string path);
 
 		/*Getter for the Attribs field*/
 		FileAttribs GetFileAttribs() const;
-
-		/*Getter for the bFileExists field*/
-		bool GetFileExists() const;
 
 		/**
 		* Function to check if program has write access to the file
@@ -143,6 +263,13 @@ namespace FileSystem {
 		*/
 		bool HasReadAccess() const;
 
+
+        /**
+		 *Sets the position of the file to pos if it exists 
+		 * return true if worked, false otherwise
+		 */
+		bool SetFilePointer(DWORD pos) const;
+
 		/**
 		* Function to write to arbitrary offset in the file
 		* 
@@ -153,8 +280,8 @@ namespace FileSystem {
 		*
 		* @return true if write successful, false if write unsuccessful
 		*/
-		bool Write(IN const LPVOID value, IN const long offset, IN const unsigned long length, __in_opt const bool truncate = false, 
-			__in_opt const bool insert = false) const;
+		bool Write(const LPVOID value, const long offset, const unsigned long length, const bool truncate = false, 
+			const bool insert = false) const;
 
 		/**
 		* Function to read from arbitrary offset in the file
@@ -166,7 +293,7 @@ namespace FileSystem {
 		*
 		* @return true if read successful, false if read unsuccessful
 		*/
-		bool Read(OUT LPVOID buffer, __in_opt const unsigned long amount, __in_opt const long offset = 0, __out_opt PDWORD amountRead = nullptr) const;
+		bool Read(LPVOID buffer, const unsigned long amount = -1, const long offset = 0, PDWORD amountRead = nullptr) const;
 
 		/**
 		* Function to read from arbitrary offset in the file
@@ -178,28 +305,28 @@ namespace FileSystem {
 		*
 		* @return true if read successful, false if read unsuccessful
 		*/
-		AllocationWrapper Read(__in_opt unsigned long amount = -1, __in_opt long offset = 0, __out_opt PDWORD amountRead = nullptr) const;
+		AllocationWrapper Read(unsigned long amount = -1, long offset = 0, PDWORD amountRead = nullptr) const;
 
 		/**
 		* Function to compute the MD5 hash of the file
 		*
 		* @return The MD5 hash of the object or an empty string if unable to calculate hash
 		*/
-		std::optional<std::wstring> GetMD5Hash() const;
+		std::optional<std::string> GetMD5Hash() const;
 
 		/**
 		* Function to compute the SHA1 hash of the file
 		*
 		* @return The SHA1 hash of the object or an empty string if unable to calculate hash
 		*/
-		std::optional<std::wstring> GetSHA1Hash() const;
+		std::optional<std::string> GetSHA1Hash() const;
 
 		/**
 		* Function to compute the SHA256 hash of the file
 		*
 		* @return The SHA256 hash of the object or an empty string if unable to calculate hash
 		*/
-		std::optional<std::wstring> GetSHA256Hash() const;
+		std::optional<std::string> GetSHA256Hash() const;
 
 		/**
 		* Function to see if a file matches a given set of search criteria
@@ -208,7 +335,7 @@ namespace FileSystem {
 		*
 		* @return a boolean indicating if the file matched the criteria
 		*/
-		bool MatchesAttributes(IN const FileSearchAttribs& searchAttribs) const;
+		bool MatchesAttributes(const FileSearchAttribs& searchAttribs) const;
 
 		/**
 		 * Returns whether or not the current file is signed.
@@ -245,7 +372,7 @@ namespace FileSystem {
 		*
 		* @return true if trucation or extension was successful, false if unsuccessful
 		*/
-		bool ChangeFileLength(IN const long length) const;
+		bool ChangeFileLength(const long length) const;
 
 		/**
 		 * Gets the number of bytes in the referenced file
@@ -259,64 +386,7 @@ namespace FileSystem {
 		 *
 		 * @return The file path of the object
 		 */
-		virtual std::wstring ToString() const;
-
-		/**
-		* Function to get the file owner
-		*
-		* @return an Owner object representing the owner of the file
-		*/
-		std::optional<Permissions::Owner> GetFileOwner() const;
-
-		/**
-		* Function to set a file owner
-		*
-		* @param owner An Owner object representing the new file owner
-		* @return true if the file is now owned by the new user, false otherwise
-		*/
-		bool SetFileOwner(const Permissions::Owner& owner);
-
-		/**
-		* Function to get the permissions a user or group has on a file
-		*
-		* @param owner An Owner object to check permissions for
-		* @return An ACCESS_MASK object 
-		*/
-		ACCESS_MASK GetAccessPermissions(const Permissions::Owner& owner);
-
-		/**
-		* Function to get permissions that the everyone group has
-		*
-		* @return the permissions granted to the everyone group
-		*/
-		ACCESS_MASK GetEveryonePermissions();
-
-		/**
-		* Function to set bluespawn's process owner as the owner of the file
-		*
-		* @return true if successful, false otherwise
-		*/
-		bool TakeOwnership();
-
-		/**
-		* Function to grant certain permissions to certain user or group
-		*
-		* @param owner The user or group to grant permissions to
-		* @param amAccess The access to grant to owner
-		*
-		* @return true if the permissions were granted, false otherwise
-		*/
-		bool GrantPermissions(const Permissions::Owner& owner, const ACCESS_MASK& amAccess);
-
-		/**
-		* Function to deny certain permissions to certain user or group
-		*
-		* @param owner The user or group to deny permissions to
-		* @param amAccess The access to deny the owner
-		*
-		* @return true if the permissions were denied, false otherwise
-		*/
-		bool DenyPermissions(const Permissions::Owner& owner, const ACCESS_MASK& amAccess);
+		virtual std::string ToString() const;
 
 		/**
 		* Function to quarantine file
@@ -325,47 +395,20 @@ namespace FileSystem {
 		*/
 		bool Quarantine();
 
-		/**
-		* Function to get the creation time of the file
-		*
-		* @return a FILETIME struct containing the creation time of the file. If an error,
-		*     occurs the function returns std::nullopt and calls SetLastError with the error
-		*/
-		std::optional<FILETIME> GetCreationTime() const;
-
-		/**
-		* Function to get the last modified time of the file
-		*
-		* @return a FILETIME struct containing the last modified time of the file. If an error,
-		*     occurs the function returns std::nullopt and calls SetLastError with the error
-		*/
-		std::optional<FILETIME> GetModifiedTime() const;
-
-		/**
-		* Function to get the last access time of the file
-		*
-		* @return a FILETIME struct containing the last access time of the file. If an error,
-		*     occurs the function returns std::nullopt and calls SetLastError with the error
-		*/
-		std::optional<FILETIME> GetAccessTime() const;
+		virtual void Close();
 	};
 
-	class Folder {
+	class Folder : public FileObject{
 
-		//Path to the current folder
-		std::wstring FolderPath;
+		//Handle to the directory itself
+		DIR * hDirectory;
 
-		//Whether or not the current folder exists
-		bool bFolderExists;
-
-		//Handle to current file or directory
-		FindWrapper hCurFile;
+		//Handle to the current file or directory
+		struct dirent * hCurFile;
 
 		//Is the current handle a file or directory
 		bool bIsFile;
 
-		//Information about found files
-		WIN32_FIND_DATA ffd;
 	public:
 
 		/**
@@ -373,15 +416,12 @@ namespace FileSystem {
 		* 
 		* @param path - the path to the folder
 		*/
-		Folder(const std::wstring& path);
-
-		/*Getter for FolderPath field*/
-		std::wstring GetFolderPath() const;
+		Folder(const std::string& path);
 		
 		/**
 		* Function to move to the next file
-		*
-		* @return true if successfully moved to next file false if no next file exists
+		* @deprecated: should not be used on linux.  Just returns false. WILL be removed.
+		* @return false
 		*/
 		bool MoveToNextFile();
 
@@ -392,9 +432,6 @@ namespace FileSystem {
 		*/
 
 		bool MoveToBeginning();
-
-		/*Getter for the bFolderExists field*/
-		bool GetFolderExists() const;
 
 		/**
 		* Function to check if current handle is directory or file
@@ -424,7 +461,7 @@ namespace FileSystem {
 		* @return The file if successfully created
 		*/
 
-		std::optional<File> AddFile(IN const std::wstring& fileName) const;
+		std::optional<File> AddFile(const std::string& fileName) const;
 
 		/**
 		* Function to remove current file and move to next handle
@@ -442,7 +479,7 @@ namespace FileSystem {
 		*
 		* @return all files that match the given parameters
 		*/
-		std::vector<File> GetFiles(__in_opt std::optional<FileSearchAttribs> attribs = std::nullopt, __in_opt int recurDepth = 0);
+		std::vector<File> GetFiles(std::optional<FileSearchAttribs> attribs = std::nullopt, int recurDepth = 0);
 
 		/**
 		* Function to return all subdirectories in the current folder
@@ -451,43 +488,13 @@ namespace FileSystem {
 		*
 		* @return all subfolders in the current folder
 		*/
-		std::vector<Folder> GetSubdirectories(__in_opt int recurDepth = 0);
+		std::vector<Folder> GetSubdirectories(int recurDepth = 0);
 
 		/**
-		* Function to get the folder owner
-		*
-		* @return an Owner object representing the owner of the file
-		*/
-		std::optional<Permissions::Owner> GetFolderOwner() const;
+		 *@return true if the contents of the file can be deleted by owner
+		 */ 
+		bool CanDeleteContents(const Permissions::Owner &owner);
 
-		/**
-		* Function to set a folder owner
-		*
-		* @param owner An Owner object representing the new folder owner
-		* @return true if the folder is now owned by the new user, false otherwise
-		*/
-		bool SetFolderOwner(const Permissions::Owner& owner);
-
-		/**
-		* Function to get the permissions a user or group has on a folder
-		*
-		* @param owner An Owner object to check permissions for
-		* @return An ACCESS_MASK object
-		*/
-		ACCESS_MASK GetAccessPermissions(const Permissions::Owner& owner);
-
-		/**
-		* Function to get permissions that the everyone group has
-		*
-		* @return the permissions granted to the everyone group
-		*/
-		ACCESS_MASK GetEveryonePermissions();
-
-		/**
-		* Function to set bluespawn's process owner as the owner of the folder
-		*
-		* @return true if successful, false otherwise
-		*/
-		bool TakeOwnership();
+		virtual void Close();
 	};
 }

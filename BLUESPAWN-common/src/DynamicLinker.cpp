@@ -1,8 +1,5 @@
 #include "common/DynamicLinker.h"
 
-#include <Windows.h>
-#include <winternl.h>
-
 #include <vector>
 #include <functional>
 #include <iostream>

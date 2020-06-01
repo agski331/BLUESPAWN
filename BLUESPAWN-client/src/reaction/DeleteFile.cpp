@@ -9,23 +9,28 @@
 namespace Reactions {
 
 	void DeleteFileReaction::DeleteFileIdentified(std::shared_ptr<FILE_DETECTION> detection) {
-		if (io.GetUserConfirm(L"File " + detection->wsFilePath + L" appears to be malicious. Delete file?") == 1) {
+		if (io.GetUserConfirm("File " + detection->wsFilePath + " appears to be malicious. Delete file?") == 1) {
 			if (!detection->fFile.TakeOwnership()) {
-				LOG_ERROR("Unable to take ownership of file, still attempting to delete. (Error: " << GetLastError() << ")");
+				LOG_ERROR("Unable to take ownership of file, still attempting to delete. (Error: " << errno << ")");
 			}
-			ACCESS_MASK amDelete{ 0 };
-			Permissions::AccessAddDelete(amDelete);
+			
 			std::optional<Permissions::Owner> BluespawnOwner = Permissions::GetProcessOwner();
-			if (BluespawnOwner == std::nullopt) {
-				LOG_ERROR("Unable to get process owner, still attempting to delete. (Error: " << GetLastError() << ")");
-			}
-			else {
-				if (!detection->fFile.GrantPermissions(*BluespawnOwner, amDelete)) {
-					LOG_ERROR("Unable to grant delete permission, still attempting to delete. (Error: " << GetLastError() << ")");
+			if(BluespawnOwner == std::nullopt){
+				LOG_ERROR("Unable to get process owner, still attempting to delete. (eError: " << errno << ")");
+			}else{
+				std::optional<FileSystem::Folder> folder = detection->fFile.GetDirectory();
+				if(!detection->fFile.CanDelete(*BluespawnOwner)){
+					LOG_ERROR("We do not have permission to delete this file.  Attempting to grant it.");
+					if(!folder.value().GrantPermissions(S_IXUSR | S_IWUSR)){
+						LOG_ERROR("Unable to grant delete perms to file");
+					}
 				}
 			}
-			if (!detection->fFile.Delete()) {
-				LOG_ERROR("Unable to delete file " << detection->wsFilePath << ". (Error " << GetLastError() << ")");
+
+			if(detection->fFile.Delete()){
+				LOG_VERBOSE(2, "Deleted file");
+			}else{
+				LOG_ERROR("Error deleting file " << errno << ".");
 			}
 		}
 	}

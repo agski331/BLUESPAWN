@@ -1,5 +1,4 @@
 #pragma once
-#include <Windows.h>
 
 #include <vector>
 #include <string>
@@ -18,7 +17,6 @@ class Reaction {
 protected: 
 	/// Handlers for detections
 	std::vector<DetectFile> vFileReactions;
-	std::vector<DetectRegistry> vRegistryReactions;
 	std::vector<DetectService> vServiceReactions;
 	std::vector<DetectProcess> vProcessReactions;
 	std::vector<DetectEvent> vEventReactions;
@@ -34,7 +32,6 @@ public:
 
 	/// These functions handle the identification of a detection by calling all of the associated handlers
 	void FileIdentified(std::shared_ptr<FILE_DETECTION>);
-	void RegistryKeyIdentified(std::shared_ptr<REGISTRY_DETECTION>);
 	void ProcessIdentified(std::shared_ptr<PROCESS_DETECTION>);
 	void ServiceIdentified(std::shared_ptr<SERVICE_DETECTION>);
 	void EventIdentified(std::shared_ptr<EVENT_DETECTION>);
@@ -45,7 +42,6 @@ public:
 
 	/// These functions add handlers for detections
 	void AddFileReaction(DetectFile handler);
-	void AddRegistryReaction(DetectRegistry handler);
 	void AddProcessReaction(DetectProcess handler);
 	void AddServiceReaction(DetectService handler);
 	void AddEventReaction(DetectEvent handler);

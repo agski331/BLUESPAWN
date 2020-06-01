@@ -1,6 +1,6 @@
 #pragma once   
 
-#include "windows.h"
+#include ""
 #include <stdio.h>
 #include <winevt.h>
 #include <functional>

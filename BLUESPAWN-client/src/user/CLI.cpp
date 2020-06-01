@@ -3,29 +3,30 @@
 #include <chrono>
 #include <iostream>
 #include <limits>
-#include "common/stringutils.h"
+#include <pthread.h>
+#include "common/StringUtils.h"
 
 #undef max
 
 //Identifiers for different message types
-#define INFORM_ID L"[*]"
-#define ALERT_ID L"[!]"
-#define CONFIRM_ID L"[+]"
-#define SELECT_ID L"[?]"
+#define INFORM_ID "[*]"
+#define ALERT_ID "[!]"
+#define CONFIRM_ID "[+]"
+#define SELECT_ID "[?]"
 
 //Colors for different parts of messages
 const MessageColor ID_COLOR = MessageColor::BLUE;
 const MessageColor TEXT_COLOR = MessageColor::LIGHTGRAY;
 
 //Case-insensitive options for user confirmation.
-const std::set<std::wstring> affirmativeOptions = { L"yes", L"y" };
-const std::set<std::wstring> negativeOptions = { L"no", L"n" };
-const std::set<std::wstring> cancelOptions = { L"c", L"cancel" };
+const std::set<std::wstring> affirmativeOptions = { "yes", "y" };
+const std::set<std::wstring> negativeOptions = { "no", "n" };
+const std::set<std::wstring> cancelOptions = { "c", "cancel" };
 
-const std::wstring descriptions[3] = {
-	L"[LOW]",
-	L"[MEDIUM]",
-	L"[HIGH]"
+const std::string descriptions[3] = {
+	"[LOW]",
+	"[MEDIUM]",
+	"[HIGH]"
 };
 
 const MessageColor colors[3] = {
@@ -34,22 +35,21 @@ const MessageColor colors[3] = {
 	MessageColor::RED
 };
 
-CLI::CLI() : hMutex{ CreateMutexW(nullptr, false, L"Local\\CLI-Mutex") } {}
+CLI::CLI() : hMutex{ pthread_mutex_init(&hMutex, NULL) } {}
 
-void Print(const std::wstring& wMessage, MessageColor color = TEXT_COLOR, bool newline=true){
-	HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-	SetConsoleTextAttribute(hConsole, static_cast<WORD>(color));
+void Print(const std::string& wMessage, MessageColor color = TEXT_COLOR, bool newline=true){
 	if(newline){
-		std::wcout << wMessage << std::endl;
+		std::cout << wMessage << std::endl;
 	} else {
-		std::wcout << wMessage;
+		std::cout << wMessage;
 	}
 }
 
-std::optional<std::wstring> GetInput(DWORD dwMaximumDelay){
+std::optional<std::string> GetInput(DWORD dwMaximumDelay){
 	std::wstring output{};
-	auto result = WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), dwMaximumDelay);
-	if(result == WAIT_OBJECT_0){
+	//TODO: port
+	auto result = pthread_mutex_timedlock(&hMutex, &spec)
+	if(result == 0){
 		std::wstring input{};
 		std::getline(std::wcin, input);
 		return input;
@@ -64,24 +64,24 @@ const CLI& CLI::GetInstance(){
 	return instance;
 }
 
-std::wstring CLI::GetUserSelection(const std::wstring& prompt, const std::vector<std::wstring>& options,
+std::wstring CLI::GetUserSelection(const std::string& prompt, const std::vector<std::string>& options,
 	DWORD dwMaximumDelay, ImportanceLevel level) const {
 	auto mutex = AcquireMutex(hMutex);
 	Print(SELECT_ID, ID_COLOR, false);
 	Print(descriptions[static_cast<DWORD>(level)], colors[static_cast<DWORD>(level)], false);
-	Print(L" " + prompt);
+	Print(" " + prompt);
 
 	int i = 0;
 	for (auto str : options) {
 		i += 1;
-		Print(std::to_wstring(i), MessageColor::CYAN, false);
-		Print(L". " + str);
+		Print(std::to_string(i), MessageColor::CYAN, false);
+		Print(". " + str);
 	}
-	Print(L"Please enter a number 1 through " + std::to_wstring(i) + L" to continue. ", MessageColor::LIGHTGRAY, false);
+	Print("Please enter a number 1 through " + std::to_string(i) + " to continue. ", MessageColor::LIGHTGRAY, false);
 
 	while(true){
 		size_t userIn = 0;
-		std::wstringstream stream{};
+		std::stringstream stream{};
 		auto input = GetInput(dwMaximumDelay);
 		if(!input){
 			return {};
@@ -91,7 +91,7 @@ std::wstring CLI::GetUserSelection(const std::wstring& prompt, const std::vector
 			if(stream.good() && userIn > 0 && userIn <= i){
 				return options[userIn - 1];
 			} else {
-				Print(L"Please enter a number 1 through " + std::to_wstring(i) + L" to continue. ", MessageColor::LIGHTGRAY, false);
+				Print("Please enter a number 1 through " + std::to_wstring(i) + " to continue. ", MessageColor::LIGHTGRAY, false);
 			}
 		}
 	};
@@ -99,29 +99,29 @@ std::wstring CLI::GetUserSelection(const std::wstring& prompt, const std::vector
 	return L"";
 }
 
-void CLI::InformUser(const std::wstring& information, ImportanceLevel level) const {
+void CLI::InformUser(const std::string& information, ImportanceLevel level) const {
 	auto mutex = AcquireMutex(hMutex);
 	Print(INFORM_ID, ID_COLOR, false);
 	Print(descriptions[static_cast<DWORD>(level)], colors[static_cast<DWORD>(level)], false);
-	Print(L" " + information);
+	Print(" " + information);
 }
-bool CLI::AlertUser(const std::wstring& information, DWORD dwMaximumDelay, ImportanceLevel level) const {
+bool CLI::AlertUser(const std::string& information, DWORD dwMaximumDelay, ImportanceLevel level) const {
 	auto mutex = AcquireMutex(hMutex);
 	Print(ALERT_ID, ID_COLOR, false);
 	Print(descriptions[static_cast<DWORD>(level)], colors[static_cast<DWORD>(level)], false);
-	Print(L" " + information);
-	Print(L"Press enter to continue. ", MessageColor::LIGHTGRAY, false);
-	Print(L"");
+	Print(" " + information);
+	Print("Press enter to continue. ", MessageColor::LIGHTGRAY, false);
+	Print("");
 	return GetInput(dwMaximumDelay).has_value();
 }
 
-DWORD CLI::GetUserConfirm(const std::wstring& prompt, DWORD dwMaximumDelay, ImportanceLevel level) const {
+DWORD CLI::GetUserConfirm(const std::string& prompt, DWORD dwMaximumDelay, ImportanceLevel level) const {
 	auto mutex = AcquireMutex(hMutex);
 	Print(CONFIRM_ID, ID_COLOR, false);
 	Print(descriptions[static_cast<DWORD>(level)], colors[static_cast<DWORD>(level)], false);
-	Print(L" " + prompt);
+	Print(" " + prompt);
 	while(true){
-		Print(L"Enter y(es), n(o), or c(ancel). ", MessageColor::LIGHTGRAY, false);
+		Print("Enter y(es), n(o), or c(ancel). ", MessageColor::LIGHTGRAY, false);
 		auto result = GetInput(dwMaximumDelay);
 		if(!result){
 			return -1;
@@ -138,6 +138,6 @@ DWORD CLI::GetUserConfirm(const std::wstring& prompt, DWORD dwMaximumDelay, Impo
 	}
 }
 
-const HandleWrapper& CLI::GetMutex() const {
+const pthread_mutex_t& CLI::GetMutex() const {
 	return hMutex;
 }

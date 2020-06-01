@@ -1,6 +1,7 @@
 #pragma once
-#include <Windows.h>
-
+#include <sys/mman.h>
+#include <pthread.h>
+#include <string.h>
 #include <map>
 #include <string>
 #include <memory>
@@ -35,67 +36,22 @@ public:
 	T Get() const { return WrappedObject; }
 };
 
-class HandleWrapper : public GenericWrapper<HANDLE> {
-public:
-	HandleWrapper(HANDLE handle) :
-		GenericWrapper(handle, std::function<void(HANDLE)>(SafeCloseHandle), INVALID_HANDLE_VALUE){};
-	static void SafeCloseHandle(HANDLE handle) {
-		BY_HANDLE_FILE_INFORMATION hInfo;
-		if (GetFileInformationByHandle(handle, &hInfo)) {
-			CloseHandle(handle);
-		}
-		else {
-			HRESULT a = GetLastError();
-			if (a != ERROR_INVALID_HANDLE) {
-				CloseHandle(handle);
-			}
-		}
-	}
-};
-
 class FindWrapper : public GenericWrapper<HANDLE> {
 public:
 	FindWrapper(HANDLE handle) :
 		GenericWrapper(handle, std::function<void(HANDLE)>(FindClose), INVALID_HANDLE_VALUE){};
 };
 
-typedef HandleWrapper MutexType;
+typedef pthread_mutex_t MutexType;
 class AcquireMutex {
-	MutexType hMutex;
+	MutexType &hMutex;
 	std::shared_ptr<void> tracker;
 
 public:
 	explicit AcquireMutex(const MutexType& mutex) :
 		hMutex{ mutex },
-		tracker{ nullptr, [&](LPVOID nul){ ReleaseMutex(hMutex); } }{
-		::WaitForSingleObject(hMutex, INFINITE);
-	}
-};
-
-class CriticalSection {
-	CRITICAL_SECTION section;
-	std::shared_ptr<CRITICAL_SECTION> tracker;
-
-public:
-	CriticalSection() :
-		section{ nullptr, 0, 0, nullptr, nullptr, 0 },
-		tracker{ &section, [](PCRITICAL_SECTION section){ DeleteCriticalSection(section); } }{
-		InitializeCriticalSection(&section);
-	}
-
-	operator PCRITICAL_SECTION(){ return &section; }
-	operator CRITICAL_SECTION(){ return section; }
-};
-
-class BeginCriticalSection {
-	CriticalSection critsec;
-	std::shared_ptr<void> tracker;
-
-public:
-	explicit BeginCriticalSection(const CriticalSection& section) :
-		critsec{ section },
-		tracker{ nullptr, [&](LPVOID nul){ LeaveCriticalSection(critsec); } }{
-		::EnterCriticalSection(critsec);
+		tracker{ nullptr, [&](LPVOID nul){ pthread_mutex_unlock(hMutex); } }{
+		pthread_mutex_lock(hMutex);
 	}
 };
 
@@ -106,7 +62,7 @@ class AllocationWrapper {
 
 public:
 	enum AllocationFunction {
-		VIRTUAL_ALLOC, HEAP_ALLOC, MALLOC, CPP_ALLOC, CPP_ARRAY_ALLOC, STACK_ALLOC, LOCAL_ALLOC, GLOBAL_ALLOC
+		MALLOC, CPP_ALLOC, CPP_ARRAY_ALLOC, STACK_ALLOC
 	};
 
 	AllocationWrapper(LPVOID memory, SIZE_T size, AllocationFunction AllocationType = STACK_ALLOC) :
@@ -120,14 +76,6 @@ public:
 						delete[] value;
 					else if(AllocationType == MALLOC)
 						free(value);
-					else if(AllocationType == HEAP_ALLOC)
-						HeapFree(GetProcessHeap(), 0, value);
-					else if(AllocationType == VIRTUAL_ALLOC)
-						VirtualFree(value, 0, MEM_RELEASE);
-					else if(AllocationType == GLOBAL_ALLOC)
-						GlobalFree(value);
-					else if(AllocationType == LOCAL_ALLOC)
-						LocalFree(value);
 				}
 			}} : std::nullopt
 	    },
@@ -222,10 +170,10 @@ class MemoryWrapper {
 
 public:
 	T* address;
-	HandleWrapper process;
+	pid_t process;
 	SIZE_T MemorySize;
 
-	MemoryWrapper(LPVOID lpMemoryBase, SIZE_T size = sizeof(T), HANDLE process = GetCurrentProcess())
+	MemoryWrapper(LPVOID lpMemoryBase, SIZE_T size = sizeof(T), pid_t process = getpid())
 		: address{ reinterpret_cast<T*>(lpMemoryBase) }, process{ process }, MemorySize{ size } {}
 
 	T Dereference() const {
@@ -281,11 +229,10 @@ public:
 
 	bool Protect(DWORD protections, SIZE_T size = -1){
 		if(size == -1) size = MemorySize;
-		DWORD dwOldProtections{};
 		if(!process){
-			return VirtualProtect(address, size, protections, &dwOldProtections);
+			return mprotect(address, size, protections); //TODO: not really sure what their intention with the whole having the process argument is.
 		} else {
-			return VirtualProtectEx(process, address, size, protections, &dwOldProtections);
+			return mprotect(address, size, protections);
 		}
 	}
 
@@ -355,7 +302,7 @@ public:
 					return { nullptr, 0 };
 				}
 			} else{
-				MoveMemory(wrapper, address, size);
+				memmove(wrapper, address, size);
 				return wrapper;
 			}
 		} else{
@@ -367,7 +314,7 @@ public:
 					return { nullptr, 0 };
 				}
 			} else{
-				MoveMemory(wrapper, address, size);
+				memmove(wrapper, address, size);
 				return wrapper;
 			}
 		}

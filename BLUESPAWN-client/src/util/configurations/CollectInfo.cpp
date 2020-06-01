@@ -1,4 +1,4 @@
-#include <windows.h>
+
 
 #define SECURITY_WIN32
 #include <Security.h>

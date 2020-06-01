@@ -1,5 +1,5 @@
 #include "common/Utils.h"
-#include <windows.h>
+
 #include <iostream>
 #include <sstream>
 #include <iomanip>

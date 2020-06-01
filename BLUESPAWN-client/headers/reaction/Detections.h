@@ -1,20 +1,19 @@
 #pragma once
 
-#include <Windows.h>
 
 #include <string>
 #include <functional>
 #include <memory>
+#include <unordered_map>
+#include <libgen.h>
 
 #include "hunt/HuntInfo.h"
-#include "util/configurations/RegistryValue.h"
 #include "util/filesystem/FileSystem.h"
 #include "common/StringUtils.h"
 #include "common/Utils.h"
 
 enum class DetectionType {
 	File,
-	Registry,
 	Service,
 	Process,
 	Event
@@ -27,20 +26,22 @@ struct DETECTION {
 
 /// A struct containing information about a file identified in a hunt
 struct FILE_DETECTION : public DETECTION {
-	std::wstring wsFileName;
-	std::wstring wsFilePath;
-	std::wstring md5;
-	std::wstring sha1;
-	std::wstring sha256;
-	std::wstring created;
-	std::wstring modified;
-	std::wstring accessed;
+	std::string wsFileName;
+	std::string wsFilePath;
+	std::string md5;
+	std::string sha1;
+	std::string sha256;
+	std::string created;
+	std::string modified;
+	std::string accessed;
 	FileSystem::File fFile;
 	FILE_DETECTION(const FileSystem::File f) : 
 		DETECTION{ DetectionType::File },
 		wsFilePath{ f.GetFilePath() }, 
 		fFile{ f } {
-		wsFileName = ToLowerCaseW(wsFilePath.substr(wsFilePath.find_last_of(L"\\/") + 1));
+		char buffer[PATH_MAX + 1];
+		strncpy(buffer, wsFilePath.c_str(), PATH_MAX + 1);
+		wsFileName = std::string(basename(buffer));
 		if (f.GetMD5Hash()) {
 			md5 = f.GetMD5Hash().value();
 		}
@@ -51,7 +52,7 @@ struct FILE_DETECTION : public DETECTION {
 			sha256 = f.GetSHA256Hash().value();
 		}
 		if (f.GetCreationTime()) {
-			created = FormatWindowsTime(f.GetCreationTime().value());
+			created = FormatWindowsTime(f.GetCreationTime().value()); //TODO: work on filetime conversion
 		}
 		if (f.GetModifiedTime()) {
 			modified = FormatWindowsTime(f.GetModifiedTime().value());
@@ -63,23 +64,14 @@ struct FILE_DETECTION : public DETECTION {
 };
 typedef std::function<void(std::shared_ptr<FILE_DETECTION>)> DetectFile;
 
-/// A struct containing information about a registry key value identified in a hunt
-struct REGISTRY_DETECTION : public DETECTION {
-	Registry::RegistryValue value;
-	REGISTRY_DETECTION(const Registry::RegistryValue& value) :
-		DETECTION{ DetectionType::Registry },
-		value{ value }{}
-};
-typedef std::function<void(std::shared_ptr<REGISTRY_DETECTION>)> DetectRegistry;
-
 /// A struct containing information about a service identified in a hunt
 struct SERVICE_DETECTION : public DETECTION {
-	std::wstring wsServiceName;
-	std::wstring wsServiceExecutablePath;
-	std::wstring wsServiceDll;
+	std::string wsServiceName;
+	std::string wsServiceExecutablePath;
+	std::string wsServiceDll;
 	int ServicePID;
-	SERVICE_DETECTION(const std::wstring& wsServiceName, const std::wstring& wsServiceExecutablePath, 
-		const std::wstring& wsServiceDll, const int& ServicePID) :
+	SERVICE_DETECTION(const std::string& wsServiceName, const std::string& wsServiceExecutablePath, 
+		const std::string& wsServiceDll, const int& ServicePID) :
 		DETECTION{ DetectionType::Service },
 		wsServiceName{ wsServiceName },
 		wsServiceExecutablePath{ wsServiceExecutablePath },
@@ -98,14 +90,14 @@ enum class ProcessDetectionMethod {
 };
 
 struct PROCESS_DETECTION : public DETECTION {
-	std::wstring wsImagePath;
-	std::wstring wsCmdline;
+	std::string wsImagePath;
+	std::string wsCmdline;
 	int PID;
 	DWORD method;
 	LPVOID lpAllocationBase;
 	DWORD dwAllocationSize;
 	BYTE AllocationStart[512];      // This member is intended to be used for signaturing purposes
-	PROCESS_DETECTION(const std::wstring& wsImagePath, const std::wstring& wsCmdLine, const int& PID,
+	PROCESS_DETECTION(const std::string& wsImagePath, const std::string& wsCmdLine, const int& PID,
 		const LPVOID& lpAllocationBase, const DWORD& dwAllocationSize, const DWORD& method) :
 		DETECTION{ DetectionType::Process },
 		wsImagePath{ wsImagePath },
@@ -137,9 +129,9 @@ struct EVENT_DETECTION : public DETECTION {
 	std::wstring timeCreated;
 	std::wstring channel;
 	std::wstring rawXML;
-	std::unordered_map<std::wstring, std::wstring> params;
+	std::unordered_map<std::string, std::string> params;
 	
-	EVENT_DETECTION(unsigned int eventID, unsigned int eventRecordID, std::wstring timeCreated, std::wstring channel, std::wstring rawXML) :
+	EVENT_DETECTION(unsigned int eventID, unsigned int eventRecordID, std::string timeCreated, std::string channel, std::string rawXML) :
 		DETECTION{ DetectionType::Event },
 		eventID{ eventID },
 		eventRecordID{ eventRecordID },

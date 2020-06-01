@@ -1,7 +1,5 @@
 #include "common/StringUtils.h"
 
-#include <Windows.h>
-
 #include <string>
 #include <codecvt>
 #include <algorithm>

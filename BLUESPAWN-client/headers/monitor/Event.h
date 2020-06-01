@@ -6,14 +6,11 @@
 #include "reaction/Reaction.h"
 #include "hunt/Scope.h"
 #include "util/eventlogs/EventSubscription.h"
-#include "util/configurations/Registry.h"
-#include "util/configurations/RegistryValue.h"
 #include "util/eventlogs/XpathQuery.h"
 #include "util/filesystem/FileSystem.h"
 
 enum class EventType {
 	EventLog,
-	Registry,
 	FileSystem
 };
 
@@ -59,31 +56,6 @@ private:
 	std::vector<EventLogs::XpathQuery> queries;
 };
 
-class RegistryEvent : public Event {
-	
-	// Event that is triggered when the key changes
-	HandleWrapper hEvent;
-
-	// True if this event watches subkeys. Note that this will be unable to determine
-	// which value (or subkey) was changed.
-	bool WatchSubkeys;
-
-	// The registry key being watched
-	Registry::RegistryKey key;
-
-public:
-
-	RegistryEvent(const Registry::RegistryKey& key, bool WatchSubkeys = false);
-
-	const HandleWrapper& GetEvent() const;
-
-	const Registry::RegistryKey& GetKey() const;
-
-	virtual bool Subscribe();
-
-	virtual bool operator==(const Event& e) const;
-};
-
 class FileEvent : public Event {
 
 	/// Directory to be watched
@@ -103,7 +75,3 @@ public:
 
 	virtual bool operator==(const Event& e) const;
 };
-
-namespace Registry {
-	std::vector<std::shared_ptr<Event>> GetRegistryEvents(HKEY hkHive, const std::wstring& path, bool WatchWow64 = true, bool WatchUsers = true, bool WatchSubkeys = false);
-}

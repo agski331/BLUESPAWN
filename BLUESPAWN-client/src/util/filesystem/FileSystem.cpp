@@ -1,34 +1,46 @@
 #include "util/filesystem/FileSystem.h"
 #include "util/log/Log.h"
 #include "common/StringUtils.h"
+#include "util/linuxcompat.h"
 
-#include <windows.h>
-#include <Wincrypt.h>
+//NOTE: added when porting
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <openssl/sha.h>
+#include <openssl/md5.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <algorithm>
+#include <grp.h>
+#include <pwd.h>
+//NOTE: end
+
 #include <string>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
-#include <fileapi.h>
 #include <vector>
-#include <Shlwapi.h>
-#include <SoftPub.h>
-#include <mscat.h>
+#include <optional>
 #include "common/wrappers.hpp"
 #include "common/StringUtils.h"
-#include "aclapi.h"
-
-LINK_FUNCTION(NtCreateFile, ntdll.dll)
 
 namespace FileSystem{
-	bool CheckFileExists(const std::wstring& path) {
-		auto attribs = GetFileAttributesW(path.c_str());
-		if(INVALID_FILE_ATTRIBUTES == attribs && GetLastError() == ERROR_FILE_NOT_FOUND){
+	bool CheckFileExists(const std::string& path) {
+		auto exists = access(path.c_str(), F_OK);
+		if(exists < 0){
 			LOG_VERBOSE(3, "File " << path << " does not exist.");
 			return false;
 		}
 
-		if(attribs & FILE_ATTRIBUTE_DIRECTORY){
+		struct stat statbuf;
+
+		if(stat(path.c_str(), &statbuf) < 0){
+			LOG_ERROR("Unable to stat " << path << "."); //TODO: Check if this is correct syntax
+		}
+
+		if(S_ISDIR(statbuf.st_mode)){
 			LOG_VERBOSE(3, "File " << path << " is a directory.");
 			return false;
 		}
@@ -36,280 +48,199 @@ namespace FileSystem{
 		return true;
 	}
 
-	std::optional<std::wstring> SearchPathExecutable(const std::wstring& name){
-		std::wstring fullname = ExpandEnvStringsW(name);
-
-		auto size = SearchPathW(nullptr, fullname.c_str(), L".exe", 0, nullptr, nullptr);
-		if(!size){
+	//Will this function be fed full paths? - TDOO
+	std::optional<std::string> SearchPathExecutable(const std::string& name){
+		char * path = getenv("PATH");
+		if(!path){
+			LOG_ERROR("PATH envvar does not exist.");
 			return std::nullopt;
-		}
+		}else{
+			char * token = strtok(path, ":");
+			struct stat statbuf;
+			do{
+				if(access(token, F_OK) == 0 && stat(token, &statbuf) == 0){
+					if(S_ISDIR(statbuf.st_mode)){
+						DIR * dir = opendir(token);
+						//no way this doesnt open but check anyway
+						if(dir){
+							struct dirent * entry = readdir(dir);
+							while(entry != NULL){
+								if(strcmp(entry->d_name, name.c_str()) == 0){
+									//now check if its executable
+									//assuming this is run as root, anything should be executable as long as the exe bit is set
+									char buffer[PATH_MAX + 1];
+									snprintf(path, PATH_MAX + 1, "%s/%s", token, entry->d_name);
+									if(access(path, X_OK) == 0){
+										return std::string(buffer);
+									}
 
-		std::vector<WCHAR> buffer(static_cast<size_t>(size) + 1);
-		WCHAR* filename{};
-		if(!SearchPathW(nullptr, fullname.c_str(), L".exe", size + 1, buffer.data(), &filename)){
-			return std::nullopt;
-		}
-
-		return buffer.data();
-	}
-
-	DWORD File::SetFilePointer(DWORD64 val) const {
-		//Calculate the offset into format needed for SetFilePointer
-		long lowerMask = 0xFFFFFFFF;
-		DWORD64 upperMask = static_cast<DWORD64>(0xFFFFFFFF) << 32;
-		auto lowerVal = static_cast<DWORD>(val & lowerMask);
-		auto upperVal = static_cast<DWORD>((val & upperMask) >> 32);
-		return ::SetFilePointer(hFile, lowerVal, reinterpret_cast<PLONG>(&upperVal), 0);
-	}
-
-	std::optional<std::wstring> GetCatalog(const HandleWrapper& hFile){
-		std::optional<std::wstring> catalogfile; //Whether the file was found in system catalogs
-		HCATADMIN hCatAdmin = NULL; //Context for enumerating system catalogs
-		HCATINFO hCatInfo = NULL;
-		GUID gAction = DRIVER_ACTION_VERIFY;
-		//Hash info
-		DWORD dwHashLength = 0; //Length of the hash
-		PBYTE pbHash = NULL; //Hash of the file
-		if (!CryptCATAdminAcquireContext(&hCatAdmin, &gAction, 0)) {
-			LOG_ERROR("Error acquiring catalog admin context " << GetLastError());
-			goto end;
-		}
-
-		//Get hash length
-		if (!CryptCATAdminCalcHashFromFileHandle(hFile, &dwHashLength, NULL, 0)) {
-			LOG_ERROR("Error getting hash size " << GetLastError());
-			goto end;
+								}
+							}
+						}
+					}
+				}
+			} while ((token = strtok(NULL, ":")) != NULL);
+			
 		}
 		
-		//Get the hash of the file
-		pbHash = (PBYTE) HeapAlloc(GetProcessHeap(), 0, dwHashLength);
-		if (pbHash == NULL) {
-			LOG_ERROR("Error allocating " << dwHashLength << " bytes, out of memory.");
-			goto end;
-		}
-		if (!CryptCATAdminCalcHashFromFileHandle(hFile, &dwHashLength, pbHash, 0)) {
-			LOG_ERROR("Error getting file hash " << GetLastError());
-			goto end;
-		}
-
-		//Search catalogs for hash
-		hCatInfo = CryptCATAdminEnumCatalogFromHash(hCatAdmin, pbHash, dwHashLength, 0, &hCatInfo);
-		while (hCatInfo != NULL) {
-			CATALOG_INFO ciCatalogInfo = {};
-			ciCatalogInfo.cbStruct = sizeof(ciCatalogInfo);
-
-			if (!CryptCATCatalogInfoFromContext(hCatInfo, &ciCatalogInfo, 0))	{
-				LOG_ERROR("Couldn't get catalog info for catalog containing hash of file");
-				break;
-			}
-
-			LOG_VERBOSE(3, "Hash for file found in catalog " << ciCatalogInfo.wszCatalogFile);
-			catalogfile = ciCatalogInfo.wszCatalogFile;
-			hCatInfo = CryptCATAdminEnumCatalogFromHash(hCatAdmin, pbHash, dwHashLength, 0, &hCatInfo);
-		}
-	end:
-		if (hCatInfo != NULL) CryptCATAdminReleaseCatalogContext(&hCatAdmin, &hCatInfo, 0);
-		if (hCatAdmin != NULL) CryptCATAdminReleaseContext(&hCatAdmin, 0);
-		if (pbHash != NULL) HeapFree(GetProcessHeap(), 0, pbHash);
-		return catalogfile;
+		return std::nullopt;
 	}
 
-	bool File::GetFileInSystemCatalogs() const {
-		return GetCatalog(hFile) != std::nullopt;
+	void File::Close()
+	{
+		close(hFile);
 	}
 
-	std::optional<std::wstring> File::CalculateHashType(HashType sHashType) const {
+	std::optional<std::string> File::CalculateHashType(HashType sHashType) const {
 		if (!bFileExists) {
 			LOG_ERROR("Can't get hash of " << FilePath << ". File doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			//SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return std::nullopt;
 		}
 		if (!bReadAccess) {
 			LOG_ERROR("Can't get hash of " << FilePath << ". Insufficient permissions.");
-			SetLastError(ERROR_ACCESS_DENIED);
+			//SetLastError(ERROR_ACCESS_DENIED);
+			errno = EPERM;
 			return std::nullopt;
 		}
-		//Function from Microsoft
-		//https://docs.microsoft.com/en-us/windows/desktop/SecCrypto/example-c-program--creating-an-md-5-hash-from-file-content
 
-		// Get handle to the crypto provider
-		HCRYPTPROV hProv{};
-		if (!CryptAcquireContext(&hProv,
-			nullptr,
-			nullptr,
-			PROV_RSA_AES,
-			CRYPT_VERIFYCONTEXT)) {
-			LOG_ERROR("CryptAcquireContext failed: " << GetLastError() << " while getting hash of " << FilePath);
+		//first read in the buffer
+		auto size = lseek(hFile, 0L, SEEK_END);
+		if(size < 0){
+			LOG_ERROR("Error getting file size of " << FilePath << ".");
+		}
+
+		lseek(hFile, 0L, SEEK_SET);
+		//now that we have the size, read in the file
+		char * fbuffer = (char*) malloc(sizeof(char) * size);
+		if(!fbuffer){
+			LOG_ERROR("Error allocating memory for file");
 			return std::nullopt;
 		}
-		auto provider{ GenericWrapper<HCRYPTPROV>(hProv, [hProv](auto v) { CryptReleaseContext(hProv, 0); }) };
+
+		if(!Read(fbuffer)){
+			LOG_ERROR("Error reading file");
+			free(fbuffer);
+			return std::nullopt;
+		}
 		
-		HCRYPTHASH hHash = 0;
-		auto rgbHash = AllocationWrapper{ nullptr, 0 };
-		DWORD cbHash = 0;
-		if (sHashType == HashType::SHA1_HASH) {
-			rgbHash = AllocationWrapper{ new BYTE[SHA1LEN], SHA1LEN, AllocationWrapper::CPP_ARRAY_ALLOC };
-			cbHash = SHA1LEN;
-			if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
-				LOG_ERROR("CryptCreateHash failed: " << GetLastError() << " while getting hash of " << FilePath);
+		unsigned char hashbuf[sHashType == HashType::MD5_HASH ? MD5_DIGEST_LENGTH + 1 : sHashType == HashType::SHA1_HASH ? SHA1LEN + 1 : SHA256LEN + 1];
+		memset(hashbuf, 0x0, sizeof(hashbuf));
+		if(sHashType == HashType::MD5_HASH){
+			MD5_CTX ctx;
+			if(MD5_Init(&ctx) != 1){
+				LOG_ERROR("Error initiating md5 ctx");
+				free(fbuffer);
 				return std::nullopt;
 			}
-		}
-		else if (sHashType == HashType::SHA256_HASH) {
-			rgbHash = AllocationWrapper{ new BYTE[SHA256LEN], SHA256LEN, AllocationWrapper::CPP_ARRAY_ALLOC };
-			cbHash = SHA256LEN;
-			if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-				LOG_ERROR("CryptCreateHash failed: " << GetLastError() << " while getting hash of " << FilePath);
-				LOG_SYSTEM_ERROR(GetLastError());
-				return std::nullopt;
-			}
-		}
-		else {
-			rgbHash = AllocationWrapper{ new BYTE[MD5LEN], MD5LEN, AllocationWrapper::CPP_ARRAY_ALLOC };
-			cbHash = MD5LEN;
-			if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-				LOG_ERROR("CryptCreateHash failed: " << GetLastError() << " while getting hash of " << FilePath);
-				return std::nullopt;
-			}
-		}
-		auto HashData{ GenericWrapper<HCRYPTHASH>(hHash, CryptDestroyHash) };
-		
-		DWORD cbRead{};
-		std::wstring digits{ L"0123456789abcdef" };
-		std::vector<BYTE> file(BUFSIZE);
-		bool bResult{ false };
-		while((bResult = ReadFile(hFile, file.data(), file.size(), &cbRead, nullptr)) && cbRead){
-			if (!CryptHashData(hHash, file.data(), cbRead, 0)) {
-				LOG_ERROR("CryptHashData failed: " << GetLastError() << " while getting hash of " << FilePath);
-				return std::nullopt;
-			}
-		}
-		SetFilePointer(0);
 
-		if (!bResult) {
-			LOG_ERROR("ReadFile failed: " << GetLastError() << " while getting hash of " << FilePath);
-			return std::nullopt;
-		}
-
-		std::wstring buffer{};
-		std::wstring rgbDigits{ L"0123456789abcdef" };
-		if (CryptGetHashParam(hHash, HP_HASHVAL, reinterpret_cast<PBYTE>(LPVOID(rgbHash)), &cbHash, 0)) {
-			for (DWORD i = 0; i < cbHash; i++) {
-				buffer += rgbDigits[(rgbHash[i] >> 4) & 0xf];
-				buffer += rgbDigits[rgbHash[i] & 0xf];
+			if(MD5_Update(&ctx, fbuffer, size) != 1){
+				LOG_ERROR("Error creating md5 hash");
+				free(fbuffer);
+				return std::nullopt;
 			}
-			LOG_VERBOSE(3, "Successfully got hash of " << FilePath);
-			return buffer;
+
+			if(MD5_Final(hashbuf, &ctx) != 1){
+				LOG_ERROR("Error creating md5 hash");
+				free(fbuffer);
+				return std::nullopt;
+			}
 		}
-		else {
-			LOG_ERROR("CryptGetHashParam failed: " << GetLastError() << " while getting hash of " << FilePath);
+		else if(sHashType == HashType::SHA1_HASH){
+			SHA_CTX ctx;
+			if(SHA1_Init(&ctx) != 1){
+				LOG_ERROR("Error initiating sha1 ctx");
+				free(fbuffer);
+				return std::nullopt;
+			}
+
+			if(SHA1_Update(&ctx, fbuffer, size) != 1){
+				LOG_ERROR("Error creating sha1 hash");
+				free(fbuffer);
+				return std::nullopt;
+			}
+
+			if(SHA1_Final(hashbuf, &ctx) != 1){
+				LOG_ERROR("Error creating sha1 hash");
+				free(fbuffer);
+				return std::nullopt;
+			}
+		}
+		else if(sHashType == HashType::SHA256_HASH){
+			SHA256_CTX ctx;
+			if(SHA256_Init(&ctx) != 1){
+				LOG_ERROR("Error initiating sha256 ctx");
+				free(fbuffer);
+				return std::nullopt;
+			}
+
+			if(SHA256_Update(&ctx, fbuffer, size) != 1){
+				LOG_ERROR("Error creating sha256 hash");
+				free(fbuffer);
+				return std::nullopt;
+			}
+
+			if(SHA256_Final(hashbuf, &ctx) != 1){
+				LOG_ERROR("Error creating sha256 hash");
+				free(fbuffer);
+				return std::nullopt;
+			}
 		}
 
-		return std::nullopt;
+		free(fbuffer);
+		return std::string((char*)hashbuf);
 	}
 
-
-	File::File(IN const std::wstring& path) : hFile{ nullptr }{
+    //TODO: make this api work better with really large files?
+	File::File(const std::string& path) : bWriteAccess{false}, bReadAccess{false}{
 		if(!path.length()){
-			bFileExists = false;
-			bWriteAccess = false;
-			bReadAccess = false;
 			return;
 		}
-		FilePath = ExpandEnvStringsW(path);
-		LOG_VERBOSE(2, "Attempting to open file: " << FilePath << ".");
-		if(FilePath.at(0) == L'\\'){
-			HANDLE hFile{};
-			UNICODE_STRING UnicodeName{ 
-				static_cast<USHORT>(FilePath.length() * 2),
-				static_cast<USHORT>(FilePath.length() * 2),
-				const_cast<PWCHAR>(FilePath.c_str()) 
-			};
-			OBJECT_ATTRIBUTES attributes{};
-			IO_STATUS_BLOCK IoStatus{};
-			InitializeObjectAttributes(&attributes, &UnicodeName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, nullptr, nullptr);
-			NTSTATUS Status{ Linker::NtCreateFile(&hFile, GENERIC_READ | GENERIC_WRITE, &attributes, &IoStatus, nullptr, FILE_ATTRIBUTE_NORMAL,
-												  FILE_SHARE_READ, FILE_OPEN, FILE_SEQUENTIAL_ONLY, nullptr, 0) };
-			if(NT_SUCCESS(Status)){
-				this->hFile = hFile;
-				bFileExists = true;
-				bWriteAccess = true;
-				bReadAccess = true;
-			} else if(Status == 0xC0000022 || Status == 0xC0000043){ // STATUS_ACCESS_DENIED or STATUS_SHARING_VIOLATION
-				Status = Linker::NtCreateFile(&hFile, GENERIC_READ, &attributes, &IoStatus, nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
-											  FILE_OPEN, FILE_SEQUENTIAL_ONLY, nullptr, 0);
-				if(NT_SUCCESS(Status)){
-					this->hFile = hFile;
-					bFileExists = true;
-					bWriteAccess = true;
-					bReadAccess = false;
-				} else{
-					LOG_ERROR("Unable to create a file handle for file " << FilePath << " (NTSTATUS " << Status << ")");
-					bFileExists = true;
-					bWriteAccess = false;
-					bReadAccess = false;
-				}
-			} else{
-				LOG_VERBOSE(2, "Couldn't open file since file doesn't exist (" << FilePath << ").");
-				bFileExists = false;
-				bWriteAccess = false;
-				bReadAccess = false;
-			}
-		} else{
-			hFile = CreateFileW(FilePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-								FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, nullptr);
-			if(!hFile && GetLastError() == ERROR_FILE_NOT_FOUND){
-				LOG_VERBOSE(2, "Couldn't open file, file doesn't exist " << FilePath << ".");
-				bFileExists = false;
-				bWriteAccess = false;
-				bReadAccess = false;
-			} else if(!hFile && (GetLastError() == ERROR_ACCESS_DENIED || GetLastError() == ERROR_SHARING_VIOLATION)){
-				bWriteAccess = false;
-				hFile = CreateFileW(FilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-									FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, nullptr);
-				if(!hFile && GetLastError() == ERROR_SHARING_VIOLATION){
-					LOG_VERBOSE(2, "Couldn't open file, sharing violation " << FilePath << ".");
-					bFileExists = true;
-					bReadAccess = false;
-				} else if(!hFile && GetLastError() == ERROR_ACCESS_DENIED){
-					LOG_VERBOSE(2, "Couldn't open file, Access Denied" << FilePath << ".");
-					bFileExists = true;
-					bReadAccess = false;
-				} else if(GetLastError() != ERROR_SUCCESS){
-					LOG_VERBOSE(2, "Couldn't open file " << FilePath << ". (Error " << GetLastError() << ")");
-					bFileExists = true;
-					bReadAccess = false;
-				} else {
-					LOG_VERBOSE(2, "File " << FilePath << " opened.");
-					bFileExists = true;
-					bReadAccess = true;
-				}
-			} else if(ERROR_SUCCESS == GetLastError()){
-				LOG_VERBOSE(2, "File " << FilePath << " opened.");
-				bFileExists = true;
-				bWriteAccess = true;
-				bReadAccess = true;
-			} else{
-				LOG_VERBOSE(2, "File " << FilePath << " failed to open with error " << GetLastError());
-				bFileExists = false;
-				bWriteAccess = false;
-				bReadAccess = false;
-			}
-			Attribs.extension = PathFindExtensionW(FilePath.c_str());
+		FilePath = path;
+		//first check if this is a directory - for the linux api going to make files and directories seperate
+
+		struct stat statbuf;
+
+		if(stat(path.c_str(), &statbuf) < 0){
+			LOG_ERROR("Unable to stat file " << FilePath << ".");
+			return;
 		}
-	}
 
+		if(S_ISDIR(statbuf.st_mode)){
+			LOG_ERROR("Attempting to open dir " << FilePath << " as a file.");
+			return;
+		}
 
-	std::wstring File::GetFilePath() const {
-		return FilePath;
+		LOG_VERBOSE(2, "Attempting to open file: " << FilePath << ".");
+
+		hFile = open(path.c_str(), O_RDWR );
+
+		if(hFile < 0){
+			if(errno == ENOENT){
+				LOG_ERROR("File " << FilePath << "does not exist!");
+			}else if(errno == EPERM){
+				bFileExists = true;
+				if(access(FilePath.c_str(), W_OK) == 0){
+					bWriteAccess = true;
+					hFile = open(FilePath.c_str(), O_WRONLY | O_APPEND);
+				}else if(access(FilePath.c_str(), R_OK) == 0){
+					bReadAccess = true;
+					hFile = open(FilePath.c_str(), O_RDONLY);
+				}
+
+			}
+			//TODO: any other errors to account for?
+		}else{
+			bFileExists = true;
+			bWriteAccess = true;
+			bReadAccess = true;
+		}
+
 	}
 
 	FileAttribs File::GetFileAttribs() const{
 			return Attribs;
-	}
-
-	bool File::GetFileExists() const {
-		return bFileExists;
 	}
 
 	bool File::HasWriteAccess() const {
@@ -320,114 +251,132 @@ namespace FileSystem{
 			return bReadAccess;
 	}
 
-	bool File::Write(IN const LPVOID value, IN const long offset, IN const unsigned long length, __in_opt const bool truncate, __in_opt const bool insert) const {
-		SCOPE_LOCK(SetFilePointer(0), ResetFilePointer);
+	bool File::SetFilePointer(DWORD pos) const{
+		if(!bFileExists){
+			LOG_ERROR("Cant set position of a nonexistant file");
+			return false;
+		}
+
+		return lseek(hFile, pos, SEEK_SET);
+	}
+
+	bool File::Write(const LPVOID value, const long offset, const unsigned long length, const bool truncate, const bool insert) const {
+		SCOPE_LOCK(this->SetFilePointer(0), ResetFilePointer); //TODO: not sure how to fix this yet - SetFilePointer(0) should be lseek(hFile, 0L, SEEK_SET)
 		LOG_VERBOSE(2, "Writing to file " << FilePath << " at " << offset << ". Insert = " << insert);
 
 		DWORD dwBytesIO{};
 
 		if(!bFileExists) {
 			LOG_ERROR("Can't write to file " << FilePath << ". File doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			//SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return false;
 		}
 
 		if (!bWriteAccess) {
 			LOG_ERROR("Can't write to file " << FilePath << ". Insufficient permissions.");
-			SetLastError(ERROR_ACCESS_DENIED);
+			//SetLastError(ERROR_ACCESS_DENIED);
+
+			errno = EPERM;
 			return false;
 		}
 
-		//Insert value into file at specified offset
-		if(insert && !truncate) {
-			DWORD64 dwFileSize = GetFileSize();
-			for(DWORD64 dwCopyOffset = 0; dwCopyOffset < length; dwCopyOffset += min(1 << 20, length - dwCopyOffset)){
-				DWORD dwCopySize = min(1 << 20, length - dwCopyOffset);
-				AllocationWrapper buffer = { new char[dwCopySize], dwCopySize, AllocationWrapper::CPP_ARRAY_ALLOC };
-				if(SetFilePointer(dwFileSize - dwCopyOffset - dwCopySize) == INVALID_SET_FILE_POINTER){
-					LOG_ERROR("Can't set file pointer to " << offset << " in file " << FilePath << ".");
-					return false;
-				}
-				if(!ReadFile(hFile, buffer, dwCopySize, &dwBytesIO, nullptr)){
-					LOG_ERROR("Unable to read " << FilePath << " at offset " << dwFileSize - dwCopyOffset - dwCopySize << " (Error " << GetLastError() << ")");
-					return false;
-				}
-				if(SetFilePointer(dwFileSize - dwCopyOffset) == INVALID_SET_FILE_POINTER){
-					LOG_ERROR("Can't set file pointer to " << offset << " in file " << FilePath << ".");
-					return false;
-				}
-				if(!WriteFile(hFile, buffer, dwCopySize, &dwBytesIO, nullptr)){
-					LOG_ERROR("Unable to write to " << FilePath << " at offset " << dwFileSize - dwCopyOffset << " (Error " << GetLastError() << ")");
-					return false;
-				}
-			}
-		}
-		//Write value over file at specified offset
-		if(SetFilePointer(offset) == INVALID_SET_FILE_POINTER) {
-			LOG_ERROR("Can't set file pointer to " << offset << " in file " << FilePath << ".");
-			return false;
-		}
+		off_t oldsz = lseek(hFile, 0L, SEEK_END);
+		lseek(hFile, 0L, SEEK_SET);
 
-		if(!WriteFile(hFile, value, length, &dwBytesIO, nullptr)) {
-			LOG_ERROR("Failed to write to " << FilePath << " at offset " << offset << " with error " << GetLastError());
-			return false;
-		}
-
-		if(truncate) {
-			if(!SetEndOfFile(hFile)) {
-				LOG_ERROR("Couldn't truncate file " << FilePath);
+		if(truncate){
+			if(!bReadAccess){
+				LOG_ERROR("Truncating requires read access for file " << FilePath << ".");
 				return false;
 			}
+
+			if(ftruncate(hFile, length + oldsz) < 0){
+				LOG_ERROR("Error truncating file " << FilePath << ".");
+			}
+
+			//if its truncate, dont write over the file - move the contents first
+			//buffer for old stuff
+			char * buffer = (char*) malloc(sizeof(char) * (oldsz - offset)); //TODO: use AllocationWrapper
+			lseek(hFile, offset, SEEK_SET);
+			if(read(hFile, buffer,  oldsz - offset) < 0){
+				LOG_ERROR("Error reading file for truncating");
+				free(buffer);
+				return false;
+			}
+
+
+			lseek(hFile, offset + length, SEEK_SET);
+			if(write(hFile, buffer, oldsz - offset) != oldsz-offset){
+				LOG_ERROR("Error writing to file " << FilePath << ".");
+				return false;
+			}
+
+			free(buffer);
 		}
+
+
+
+		if(lseek(hFile, offset, SEEK_SET) >= 0){
+			if(write(hFile, value, length) != length){
+				LOG_ERROR("Write failed for file " << FilePath << ".");
+				return false;
+			}
+
+			return true;
+		}else{
+			LOG_ERROR("Unable to set fd");
+			return false;
+		}
+
 		LOG_VERBOSE(1, "Successfule wrote to " << FilePath << "at offset" << offset);
 		return true;
 	}
 
-	bool File::Read(OUT LPVOID buffer, __in_opt const unsigned long amount, __in_opt const long offset, __out_opt PDWORD amountRead) const {
-		SCOPE_LOCK(SetFilePointer(0), ResetFilePointer);
+	bool File::Read(LPVOID buffer, const unsigned long amount, const long offset, PDWORD amountRead) const {
+		SCOPE_LOCK(this->SetFilePointer(0), ResetFilePointer); //TODO: again - fix this
 		LOG_VERBOSE(2, "Attempting to read " << amount << " bytes from " << FilePath << " at offset " << offset);
 		if(!bFileExists) {
 			LOG_ERROR("Can't read from " << FilePath << ". File doesn't exist.");
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return false;
 		}
 
 		if (!bReadAccess) {
 			LOG_ERROR("Can't read from " << FilePath << ". Insufficient permissions.");
-			SetLastError(ERROR_ACCESS_DENIED);
+			errno = EPERM;
 			return false;
 		}
 
-		if(SetFilePointer(offset) == INVALID_SET_FILE_POINTER) {
+		if(lseek(hFile, offset, SEEK_SET) != offset){
 			LOG_ERROR("Can't set file pointer to " << offset << " in file " << FilePath << ".");
 			return false;
 		}
 
-		DWORD dwBytesRead{};
-		if(!amountRead){
-			amountRead = &dwBytesRead;
-		}
+		int bytesRead = read(hFile, buffer, amount);
 
-		if(!ReadFile(hFile, buffer, amount, amountRead, NULL)) {
-			LOG_ERROR("Failed to read from " << FilePath << " at offset " << offset << " with error " << GetLastError());
+		if(bytesRead < 0){
+			LOG_ERROR("Error reading file " << FilePath << ".");
 			return false;
 		}
-		LOG_VERBOSE(1, "Successfully wrote " << amount << " bytes to " << FilePath);
+
+		*amountRead = bytesRead;
+		//NOTE: bug in the current repo - this was originally "wrote" instead of "read"
+		LOG_VERBOSE(1, "Successfully read " << amount << " bytes to " << FilePath);
 		return true;
 	}
 
-	AllocationWrapper File::Read(__in_opt unsigned long amount, __in_opt long offset, __out_opt PDWORD amountRead) const {
+	AllocationWrapper File::Read(unsigned long amount, long offset, PDWORD amountRead) const {
 		if(amount == -1){
 			amount = GetFileSize();
 		}
-		AllocationWrapper memory = { HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, amount + 1), amount + 1, AllocationWrapper::HEAP_ALLOC };
-		bool success = Read(memory, amount, offset, amountRead);
+		AllocationWrapper memory = { malloc(amount + 1), amount + 1, AllocationWrapper::MALLOC };
+		bool success = Read(memory.GetAsPointer(), amount, offset, amountRead);
 		return success ? memory : AllocationWrapper{ nullptr, 0 };
 	}
 
-	bool File::MatchesAttributes(IN const FileSearchAttribs& searchAttribs) const {
+	bool File::MatchesAttributes(const FileSearchAttribs& searchAttribs) const {
 		if (searchAttribs.extensions.size() > 0) {
-			std::wstring ext = ToLowerCaseW(GetFileAttribs().extension);
+			std::string ext = ToLowerCaseA(GetFileAttribs().extension);
 			if (std::count(searchAttribs.extensions.begin(), searchAttribs.extensions.end(), ext) == 0) {
 				return false;
 			}
@@ -437,7 +386,8 @@ namespace FileSystem{
 	}
 
 	bool File::GetFileSigned() const {
-		if (!bFileExists) {
+		//left off here
+		/*if (!bFileExists) {
 			LOG_ERROR("Can't check file signature for " << FilePath << ". File doesn't exist.");
 			SetLastError(ERROR_FILE_NOT_FOUND);
 			return false;
@@ -484,12 +434,12 @@ namespace FileSystem{
 				return true;
 			}
 		}
-		LOG_VERBOSE(1, FilePath << " not signed or located in system catalogs.");
+		LOG_VERBOSE(1, FilePath << " not signed or located in system catalogs.");*/
 		return false;
 	}
 
 	std::optional<std::wstring> GetCertificateIssuer(const std::wstring& wsFilePath){
-		DWORD dwEncoding{};
+		/*DWORD dwEncoding{};
 		DWORD dwContentType{};
 		DWORD dwFormatType{};
 		GenericWrapper<HCERTSTORE> hStore{ nullptr, [](HCERTSTORE store){ CertCloseStore(store, 0); }, INVALID_HANDLE_VALUE };
@@ -521,18 +471,21 @@ namespace FileSystem{
 		std::vector<WCHAR> buffer(dwSize);
 		CertNameToStrW(X509_ASN_ENCODING, &signer, CERT_SIMPLE_NAME_STR, buffer.data(), dwSize);
 
-		return std::wstring{ buffer.data(), dwSize };
+		return std::wstring{ buffer.data(), dwSize };*/
+		return std::nullopt;
 	}
 
 	bool File::IsMicrosoftSigned() const{
 		if(!bFileExists){
 			LOG_ERROR("Can't check file signature for " << FilePath << ". File doesn't exist.");
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			//SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return false;
 		}
 		if(!bReadAccess){
 			LOG_ERROR("Can't check file signature for " << FilePath << ". Insufficient permissions.");
-			SetLastError(ERROR_ACCESS_DENIED);
+			//SetLastError(ERROR_ACCESS_DENIED);
+			errno = EPERM;
 			return false;
 		}
 
@@ -540,7 +493,7 @@ namespace FileSystem{
 			return false;
 		}
 
-		if(File::GetFileInSystemCatalogs()){
+		/*if(File::GetFileInSystemCatalogs()){
 			auto catalog{ GetCatalog(hFile) };
 			if(catalog){
 				auto signer{ GetCertificateIssuer(*catalog) };
@@ -559,49 +512,45 @@ namespace FileSystem{
 			} else{
 				LOG_ERROR("Unable to get the certificate issuer for " << FilePath << ": " << SYSTEM_ERROR);
 			}
-		}
+		}*/
 		return false;
 	}
 
-	std::optional<std::wstring> File::GetMD5Hash() const {
+	std::optional<std::string> File::GetMD5Hash() const {
 		LOG_VERBOSE(3, "Attempting to get MD5 hash of " << FilePath);
 		return CalculateHashType(HashType::MD5_HASH);
 	}
 
-	std::optional<std::wstring> File::GetSHA1Hash() const {
+	std::optional<std::string> File::GetSHA1Hash() const {
 		LOG_VERBOSE(3, "Attempting to get SHA1 hash of " << FilePath);
 		return CalculateHashType(HashType::SHA1_HASH);
 	}
 
-	std::optional<std::wstring> File::GetSHA256Hash() const {
+	std::optional<std::string> File::GetSHA256Hash() const {
 		LOG_VERBOSE(3, "Attempting to get SHA256 hash of " << FilePath);
 		return CalculateHashType(HashType::SHA256_HASH);
 	}
 
 	bool File::Create() {
+		//left off here
 		LOG_VERBOSE(1, "Attempting to create file: " << FilePath);
 		if(bFileExists) {
 			LOG_ERROR("Can't create " << FilePath << ". File already exists.");
 			return false;
 		}
-		hFile = CreateFileW(FilePath.c_str(),
-			GENERIC_READ | GENERIC_WRITE,
-			FILE_SHARE_READ,
-			NULL,
-			CREATE_NEW,
-			FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL,
-			NULL);
-		if(INVALID_HANDLE_VALUE == hFile)
-		{
-			DWORD dwStatus = GetLastError();
-			LOG_ERROR("Error creating file " << FilePath << ". Error code = " << dwStatus);
-			bFileExists = false;
+
+		//TODO: should this be able to create directories too? How to distinguish between them?
+
+		if((hFile = open(FilePath.c_str(), O_RDWR | O_CREAT, S_IRWXU)) < 0){
+			LOG_ERROR("Error creating file " << FilePath << ". Error code = " << errno);
 			return false;
 		}
-		LOG_VERBOSE(1, FilePath << " successfully created.");
+
 		bFileExists = true;
-		bReadAccess = true;
 		bWriteAccess = true;
+		bReadAccess = true;
+		
+		LOG_VERBOSE(1, FilePath << "successfully created.");
 		return true;
 	}
 
@@ -611,248 +560,170 @@ namespace FileSystem{
 			LOG_ERROR("Can't delete file " << FilePath << ". File doesn't exist");
 			return false;
 		}
-		CloseHandle(hFile);
-		if(!DeleteFileW(FilePath.c_str())) {
-			DWORD dwStatus = GetLastError();
-			LOG_ERROR("Deleting file " << FilePath << " failed with error " << dwStatus);
-			hFile = CreateFileW(FilePath.c_str(),
-				GENERIC_READ | GENERIC_WRITE,
-				0,
-				NULL,
-				CREATE_NEW,
-				FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL,
-				NULL);
-			if(INVALID_HANDLE_VALUE == hFile)
-			{
-				DWORD dwStatus = GetLastError();
-				LOG_ERROR("Couldn't reopen " << FilePath << ". Error = " << dwStatus);
-				bFileExists = false;
-				return false;
-			}
-			bFileExists = true;
+
+		close(hFile);
+		if(unlink(FilePath.c_str()) < 0){
+			LOG_ERROR("Deleting file " << FilePath << " failed with error " << errno);
 			return false;
 		}
+
 		LOG_VERBOSE(1, FilePath << "deleted.");
 		bFileExists = false;
 		return true;
 	}
 
-	bool FileSystem::File::ChangeFileLength(IN const long length) const {
-		SCOPE_LOCK(SetFilePointer(0), ResetFilePointer);
-		LOG_VERBOSE(2, "Attempting to change length of " << FilePath << " to " << length);
-
-		if(!SetFilePointer(length)) {
-			LOG_ERROR("Couldn't change file pointer to " << length << " in file " << FilePath);
-			return false;
-		}
-
-		if(!SetEndOfFile(hFile)) {
-			LOG_ERROR("Couldn't change the length of file " << FilePath);
-			return false;
-		}
-		LOG_VERBOSE(2, "Changed length of " << FilePath << " to " << length);
-		return true;
+	bool FileSystem::File::ChangeFileLength(const long length) const {
+		
+		return ftruncate(hFile, length) == 0;
 	}
 
 	DWORD64 File::GetFileSize() const {
-		DWORD high = {};
-		auto size = ::GetFileSize(hFile, &high);
-		return (static_cast<DWORD64>(high) << 32) + size;
+		if(!bFileExists)
+		    return 0;
+		loff_t size = lseek64(hFile, 0L, SEEK_END);
+		lseek(hFile, 0L, SEEK_SET);
+		return size;
 	}
 
-	std::wstring File::ToString() const {
+	std::string File::ToString() const {
 		return FilePath;
 	}
 
-	std::optional<Permissions::Owner> File::GetFileOwner() const {
-		if (!bFileExists) {
-			LOG_ERROR("Can't get owner of nonexistent file " << FilePath);
-			return std::nullopt;
-		}
-		PSID psOwnerSID = NULL;
-		PISECURITY_DESCRIPTOR pDesc = NULL;
-		if (GetSecurityInfo(hFile, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &psOwnerSID, nullptr, nullptr, nullptr, reinterpret_cast<PSECURITY_DESCRIPTOR *>(&pDesc)) != ERROR_SUCCESS) {
-			LOG_ERROR("Error getting file owner for file " << FilePath << ". Error: " << GetLastError());
-			return std::nullopt;
-		}
-		pDesc->Owner = psOwnerSID;
-
-		Permissions::SecurityDescriptor secDesc(pDesc);
-		return Permissions::Owner(secDesc);
-	}
-
-	bool File::SetFileOwner(const Permissions::Owner& owner) {
+	bool FileObject::SetFileOwner(const Permissions::Owner& owner) {
 		if (!bFileExists) {
 			LOG_ERROR("Can't set owner of nonexistent file " << FilePath);
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return false;
 		}
-		if (!this->bWriteAccess) {
-			LOG_ERROR("Can't write owner of file " << FilePath << ". Lack permissions");
-			SetLastError(ERROR_ACCESS_DENIED);
+
+		if(!owner.Exists()){
+			LOG_ERROR("Cant set file to owner that doesnt exist");
 			return false;
 		}
-		if (SetSecurityInfo(hFile, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, owner.GetSID(), nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
-			LOG_ERROR("Error setting the file owner for file " << FilePath << " to " << owner << ". Error: " << GetLastError());
+		
+		if(owner.GetOwnerType() == Permissions::USER){
+
+			if(fchown(hFile, owner.GetId(), -1) < 0){
+				LOG_ERROR("Error changing file owner: " << errno);
+				return false;
+			}
+		}else if(owner.GetOwnerType() == Permissions::GROUP){
+
+			if(fchown(hFile, -1, owner.GetId()) < 0){
+				LOG_ERROR("Error changing file owner: " << errno);
+				return false;
+			}
+		}else{
+			LOG_ERROR("Invalid usertype to change owner " << owner.GetOwnerType());
 			return false;
 		}
-		LOG_VERBOSE(3, "Set the owner for file " << FilePath << " to " << owner << ".");
+		LOG_VERBOSE(3, "Set the owner for file " << FilePath << " to " << owner.GetName() << ".");
 		return true;
 	}
 
-	ACCESS_MASK File::GetAccessPermissions(const Permissions::Owner& owner) {
-		if (!bFileExists) {
-			LOG_ERROR("Can't get permissions of nonexistent file " << FilePath);
-			SetLastError(ERROR_FILE_NOT_FOUND);
-			return 0;
+	std::optional<ACCESS_MASK> FileObject::GetPermissions() const{
+		if(!bFileExists){
+			LOG_ERROR("Cant get permissions of nonexistant file " << FilePath << ".");
+		    return std::nullopt;
 		}
-		PACL paDACL = NULL;
-		PISECURITY_DESCRIPTOR pDesc = NULL;
-		if (GetSecurityInfo(hFile, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &paDACL, nullptr, reinterpret_cast<PSECURITY_DESCRIPTOR*>(&pDesc)) != ERROR_SUCCESS) {
-			LOG_ERROR("Error getting permissions on file " << FilePath << " for owner " << owner << ". Error: " << GetLastError());
-			return 0;
+		struct stat statbuf;
+		if(fstat(hFile, &statbuf) < 0){
+			LOG_ERROR("Unable to stat file");
+			return std::nullopt;
 		}
 
-		//Correct positional memory of the ACL is weird and doesn't naturally work with the SecurityDescriptor class.
-		//This gets the right data to the right place
-		Permissions::SecurityDescriptor secDesc = Permissions::SecurityDescriptor::CreateDACL(paDACL->AclSize);
-		memcpy(secDesc.GetDACL(), paDACL, paDACL->AclSize);
-		LocalFree(pDesc);
-		return Permissions::GetOwnerRightsFromACL(owner, secDesc);
-	}
-
-	ACCESS_MASK File::GetEveryonePermissions() {
-		Permissions::Owner everyone(L"Everyone");
-		return this->GetAccessPermissions(everyone);
-	}
-
-	bool File::TakeOwnership() {
-		std::optional<Permissions::Owner> BluespawnOwner = Permissions::GetProcessOwner();
-		if (BluespawnOwner == std::nullopt) {
-			return false;
-		}
-		return this->SetFileOwner(*BluespawnOwner);
-	}
-
-	bool File::GrantPermissions(const Permissions::Owner& owner, const ACCESS_MASK& amAccess) {
-		return Permissions::UpdateObjectACL(FilePath, SE_FILE_OBJECT, owner, amAccess);
-	}
-
-	bool File::DenyPermissions(const Permissions::Owner& owner, const ACCESS_MASK& amAccess) {
-		return Permissions::UpdateObjectACL(FilePath, SE_FILE_OBJECT, owner, amAccess, true);
+		return statbuf.st_mode;
 	}
 
 	bool File::Quarantine() {
-		if (!bFileExists) {
+	    if (!bFileExists) {
 			LOG_ERROR("Can't quarantine file " << FilePath << ". File doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
+			errno = ENOENT;
 			return false;
 		}
-		ACCESS_MASK amEveryoneDeniedAccess{ 0 };
-		Permissions::AccessAddAll(amEveryoneDeniedAccess);
-		return DenyPermissions(Permissions::Owner(L"Everyone"), amEveryoneDeniedAccess);
+
+		return fchmod(hFile, 0) == 0;
 	}
 
-	std::optional<FILETIME> File::GetCreationTime() const {
-		if (!bFileExists) {
-			LOG_ERROR("Can't get creation time of " << FilePath << ", file doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
-			return std::nullopt;
-		}
-		FILETIME fReturnInfo;
-		if (GetFileTime(hFile, &fReturnInfo, nullptr, nullptr)) {
-			return fReturnInfo;
-		}
-		else {
-			LOG_ERROR("Error getting creation time of " << FilePath << ". (Error: " << GetLastError() << ")");
-			return std::nullopt;
-		}
-	}
+	Folder::Folder(const std::string& path) : hDirectory{NULL}, hCurFile {NULL}, bIsFile {false} {
+		FilePath = path;
+		hDirectory = opendir(path.c_str());
+		bFileExists = true;
 
-	std::optional<FILETIME> File::GetModifiedTime() const {
-		if (!bFileExists) {
-			LOG_ERROR("Can't get last modified time of " << FilePath << ", file doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
-			return std::nullopt;
+		if(hDirectory == NULL){
+			if(errno == ENOENT){
+				bFileExists = false;
+			}
+			
+			LOG_ERROR("Unable to open directory " << FilePath << ": " << errno << ".");
+		}else{
+			//get the first file
+			hFile = dirfd(hDirectory);
+			this->MoveToBeginning();
 		}
-		FILETIME fReturnInfo;
-		if (GetFileTime(hFile, nullptr, nullptr, &fReturnInfo)) {
-			return fReturnInfo;
-		}
-		else {
-			LOG_ERROR("Error getting last modified time of " << FilePath << ". (Error: " << GetLastError() << ")");
-			return std::nullopt;
-		}
-	}
 
-	std::optional<FILETIME> File::GetAccessTime() const {
-		if (!bFileExists) {
-			LOG_ERROR("Can't get last access time of " << FilePath << ", file doesn't exist");
-			SetLastError(ERROR_FILE_NOT_FOUND);
-			return std::nullopt;
-		}
-		FILETIME fReturnInfo;
-		if (GetFileTime(hFile, nullptr, &fReturnInfo, nullptr)) {
-			return fReturnInfo;
-		}
-		else {
-			LOG_ERROR("Error getting last access time of " << FilePath << ". (Error: " << GetLastError() << ")");
-			return std::nullopt;
-		}
-	}
 
-	Folder::Folder(const std::wstring& path) : hCurFile{ nullptr } {
-		FolderPath = ExpandEnvStringsW(path);
-		std::wstring searchName = FolderPath;
-		searchName += L"\\*";
-		bFolderExists = true;
-		auto f = FindFirstFileW(searchName.c_str(), &ffd);
-		hCurFile = { f };
-		if(hCurFile == INVALID_HANDLE_VALUE) {
-			LOG_ERROR("Couldn't open folder " << FolderPath);
-			bFolderExists = false;
-		}
-		if(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-			bIsFile = false;
-		} else {
-			bIsFile = true;
-		}
-	}
-
-	std::wstring Folder::GetFolderPath() const {
-		return FolderPath;
 	}
 
 	bool Folder::MoveToNextFile() {
-		if(FindNextFileW(hCurFile, &ffd) != 0) {
-			if(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-				bIsFile = false;
-			} else {
-				bIsFile = true;
-			}
-			return true;
-		}
-		return false;
-	}
-
-	bool Folder::MoveToBeginning() {
-		std::wstring searchName = FolderPath;
-		searchName += L"\\*";
-		hCurFile = FindFirstFileW(searchName.c_str(), &ffd);
-		if(hCurFile == INVALID_HANDLE_VALUE) {
-			LOG_ERROR("Couldn't open folder " << FolderPath);
+		if(!hDirectory){
+			LOG_ERROR("Cant move to new file: Directory isnt opened");
 			return false;
 		}
-		if(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+
+		hCurFile = readdir(hDirectory);
+		if(!hCurFile){
+			LOG_ERROR("Unable to move to next file: " << errno << ".");
+			return false;
+	    }
+		//now set up booleans
+
+		if(hCurFile->d_type == DT_UNKNOWN){
+			LOG_ERROR("Unable to determine file type for file " << hCurFile->d_name);
+			return false;
+		}
+
+		if(hCurFile->d_type == DT_DIR){
 			bIsFile = false;
-		} else {
-			bIsFile = true;
+		}else{
+			if(hCurFile->d_type == DT_LNK){
+				char path[PATH_MAX + 1];
+				memset(path, 0x0, PATH_MAX + 1);
+				if(readlinkat(dirfd(hDirectory), hCurFile->d_name, path, PATH_MAX + 1) < 0){
+					LOG_ERROR("error reading symbolic link");
+					return false;
+				}
+
+				struct stat statbuf;
+
+				if(fstatat(dirfd(hDirectory), path, &statbuf, 0) < 0){
+					LOG_ERROR("Unable to stat file");
+					return false;
+				}
+
+				bIsFile = !S_ISDIR(statbuf.st_mode);
+
+				
+			}else{
+				bIsFile = true;
+			}
 		}
 		return true;
 	}
-	
-	bool Folder::GetFolderExists() const {
-		return bFolderExists;
+
+	bool Folder::MoveToBeginning() {
+
+		if(!hDirectory){
+			LOG_ERROR("Folder is not currently open");
+			return false;
+		}
+
+		if(!bFileExists){
+			LOG_ERROR("Filepath " << FilePath << "does not exist.");
+			return false;
+		}
+		rewinddir(hDirectory);
+		return this->MoveToNextFile();
 	}
 
 	bool Folder::GetCurIsFile() const {
@@ -860,35 +731,24 @@ namespace FileSystem{
 	}
 
 	std::optional<File> Folder::Open() const {
-		if(bIsFile) {
-			std::wstring fileName(ffd.cFileName);
-			std::wstring filePath(FolderPath);
-			filePath += std::wstring(L"\\") + fileName;
-			std::wstring out = filePath.c_str();
-			File file = FileSystem::File(out);
-			if(file.GetFileExists()) {
-				return file;
-			}
+		if(bIsFile && hCurFile) {
+			std::string path = FilePath + "/" + hCurFile->d_name;
+			return File(path);
 		}
 		return std::nullopt;
 	}
 
 	std::optional<Folder> Folder::EnterDir() {
-		if(!bIsFile) {
-			std::wstring folderName = FolderPath;
-			folderName += L"\\";
-			folderName += ffd.cFileName;
-			Folder folder = Folder(folderName.c_str());
-			if(folder.GetFolderExists()) return folder;
+		if(!bIsFile && hCurFile) {
+			std::string path = FilePath + "/" + hCurFile->d_name;
+			return Folder(path);
 		}
 		return std::nullopt;
 	}
 
-	std::optional<File> Folder::AddFile(IN const std::wstring& fileName) const {
-		std::wstring filePath = FolderPath;
-		std::wstring fName = fileName;
-		filePath += L"\\" + fName;
-		File file = File(filePath.c_str());
+	std::optional<File> Folder::AddFile(const std::string& fileName) const {
+		std::string path = FilePath + "/" + fileName;
+		File file = File(path);
 		if(file.GetFileExists()) {
 			return file;
 		}
@@ -910,9 +770,9 @@ namespace FileSystem{
 		return false;
 	}
 
-	std::vector<File> Folder::GetFiles(__in_opt std::optional<FileSearchAttribs> attribs, __in_opt int recurDepth) {
-		if(MoveToBeginning() == 0) {
-			LOG_ERROR("Couldn't get to beginning of folder " << FolderPath);
+	std::vector<File> Folder::GetFiles(std::optional<FileSearchAttribs> attribs, int recurDepth) {
+		if(!MoveToBeginning()) {
+			LOG_ERROR("Couldn't get to beginning of folder " << FilePath);
 			return std::vector<File>();
 		}
 		std::vector<File> toRet = std::vector<File>();
@@ -922,14 +782,13 @@ namespace FileSystem{
 				if(f) {
 					if(!attribs) {
 						toRet.emplace_back(*f);
-					}
-					else {
+					}else {
 						if (f->MatchesAttributes(attribs.value())) {
 							toRet.emplace_back(*f);
 						}
 					}
 				}
-			} else if(recurDepth != 0 && ffd.cFileName != std::wstring{ L"." } && ffd.cFileName != std::wstring{ L".." }){
+			} else if(recurDepth != 0 && hCurFile->d_name != std::string{ "." } && hCurFile->d_name != std::string{ ".." }){
 				std::vector<File> temp;
 				std::optional<Folder> f = EnterDir();
 				if(f) {
@@ -949,14 +808,14 @@ namespace FileSystem{
 		return toRet;
 	}
 
-	std::vector<Folder> Folder::GetSubdirectories(__in_opt int recurDepth) {
+	std::vector<Folder> Folder::GetSubdirectories(int recurDepth) {
 		if(MoveToBeginning() == 0) {
-			LOG_ERROR("Couldn't get to beginning of folder " << FolderPath);
+			LOG_ERROR("Couldn't get to beginning of folder " << FilePath);
 			return {};
 		}
 		std::vector<Folder> toRet = {};
 		do {
-			if(!GetCurIsFile() && recurDepth != 0 && ffd.cFileName != std::wstring{ L"." } && ffd.cFileName != std::wstring{ L".." }){
+			if(!GetCurIsFile() && recurDepth != 0 && hCurFile->d_name != std::string{ "." } && hCurFile->d_name != std::string{ ".." }){
 				std::vector<Folder> temp;
 				std::optional<Folder> f = EnterDir();
 				if(f.has_value()) {
@@ -977,65 +836,232 @@ namespace FileSystem{
 		return toRet;
 	}
 
-	std::optional<Permissions::Owner> Folder::GetFolderOwner() const {
-		if (!bFolderExists) {
-			LOG_ERROR("Can't get owner of nonexistent folder " << FolderPath);
-			return std::nullopt;
-		}
-		PSID psOwnerSID = NULL;
-		PISECURITY_DESCRIPTOR pDesc = NULL;
-		if (GetNamedSecurityInfoW((LPWSTR) FolderPath.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &psOwnerSID, nullptr, nullptr, nullptr, reinterpret_cast<PSECURITY_DESCRIPTOR*>(&pDesc)) != ERROR_SUCCESS) {
-			LOG_ERROR("Error getting file owner for folder " << FolderPath << ". Error: " << GetLastError());
-			return std::nullopt;
-		}
-		pDesc->Owner = psOwnerSID;
 
-		Permissions::SecurityDescriptor secDesc(pDesc);
-		return Permissions::Owner(secDesc);
+
+	void Folder::Close(){
+		closedir(hDirectory);
 	}
 
-	bool Folder::SetFolderOwner(const Permissions::Owner& owner) {
-		if (!bFolderExists) {
-			LOG_ERROR("Can't write owner of folder " << FolderPath << ". Folder doesn't exist");
+	bool Folder::CanDeleteContents(const Permissions::Owner &user){
+		return CanExecute(user) && CanWrite(user);
+	}
+
+	FileObject::~FileObject(){
+		this->Close();
+	}
+
+	bool FileObject::SetFileOwner(const Permissions::Owner& owner) {
+		if (!bFileExists) {
+			LOG_ERROR("Can't write owner of folder " << FilePath << ". Folder doesn't exist");
 			return false;
 		}
-		if (SetNamedSecurityInfoW((LPWSTR)FolderPath.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, owner.GetSID(), nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
-			LOG_ERROR("Error setting the folder owner for folder " << FolderPath << " to " << owner << ". Error: " << GetLastError());
+
+		if(owner.GetOwnerType() == Permissions::NONE || !owner.Exists()){
+			LOG_ERROR("Invalid owner type");
 			return false;
 		}
-		LOG_VERBOSE(3, "Set the owner for folder " << FolderPath << " to " << owner << ".");
-		return true;
-	}
 
-	ACCESS_MASK Folder::GetAccessPermissions(const Permissions::Owner& owner) {
-		if (!bFolderExists) {
-			LOG_ERROR("Can't get permissions of nonexistent folder " << FolderPath);
-			return 0;
+		if(owner.GetOwnerType() == Permissions::USER){
+			const Permissions::User &user = reinterpret_cast<const Permissions::User&>(owner);
+			return fchown(hFile, owner.GetId(), user.GetGroup()) == 0;
+		}else{
+			return fchown(hFile, -1, owner.GetId()) == 0;
 		}
-		PACL paDACL = NULL;
-		PISECURITY_DESCRIPTOR pDesc = NULL;
-		if (GetNamedSecurityInfoW((LPWSTR) FolderPath.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &paDACL, nullptr, reinterpret_cast<PSECURITY_DESCRIPTOR*>(&pDesc)) != ERROR_SUCCESS) {
-			LOG_ERROR("Error getting permissions on file " << FolderPath << " for owner " << owner << ". Error: " << GetLastError());
-			return 0;
+		return false;
+	}
+
+	//NOTE: Make some sort of class heirarchy so that I dont have to reuse this method
+	bool FileObject::HasPermHelper(const Permissions::Owner &user, DWORD userMask, DWORD groupMask, DWORD otherMask){
+		if(!bFileExists)
+		    return false;
+		std::optional<ACCESS_MASK> permissions = GetPermissions();
+
+		if(!permissions.has_value()){
+			return false;
 		}
-		//Correct positional memory of the ACL is weird and doesn't naturally work with the SecurityDescriptor class.
-		//This gets the right data to the right place
-		Permissions::SecurityDescriptor secDesc = Permissions::SecurityDescriptor::CreateDACL(paDACL->AclSize);
-		memcpy(secDesc.GetDACL(), paDACL, paDACL->AclSize);
-		LocalFree(pDesc);
-		return Permissions::GetOwnerRightsFromACL(owner, secDesc);
+
+		if(user.GetOwnerType() == Permissions::USER && permissions.value() & userMask){
+			std::optional<Permissions::Owner> userOwner = GetFileOwner(Permissions::USER);
+			if(userOwner.has_value() && userOwner.value() == user){
+				return true;
+			}
+		}
+
+		if(permissions.value() & groupMask){
+			std::optional<Permissions::Owner> groupOwner = GetFileOwner(Permissions::GROUP);
+
+			if(groupOwner.has_value() && groupOwner.value() == user){
+				return true;
+			}
+
+			//now check if the user is in the owning group
+			if(groupOwner.has_value() && user.GetOwnerType() == Permissions::USER){
+				const Permissions::User &userobj = reinterpret_cast<const Permissions::User&> (user);
+				if(userobj.GetGroup() == groupOwner.value().GetId()){
+					return true;
+				}
+			}
+		}
+
+		if(permissions.value() & otherMask){
+			return true;
+		}
+
+		return false;
 	}
 
-	ACCESS_MASK Folder::GetEveryonePermissions() {
-		Permissions::Owner everyone(L"Everyone");
-		return this->GetAccessPermissions(everyone);
+	bool FileObject::CanRead(const Permissions::Owner &user){
+		return HasPermHelper(user, S_IRUSR, S_IRGRP, S_IROTH);
 	}
 
-	bool Folder::TakeOwnership() {
+	bool FileObject::CanWrite(const Permissions::Owner &user){
+		return HasPermHelper(user, S_IWUSR, S_IWGRP, S_IWOTH);
+	}
+
+	bool FileObject::CanExecute(const Permissions::Owner &user){
+		return HasPermHelper(user, S_IXUSR, S_IXGRP, S_IXOTH);
+	}
+
+	bool FileObject::CanDelete(const Permissions::Owner &user){
+		if(FilePath == "/" || !bFileExists){
+			return false;
+		}
+
+		return GetDirectory().value().CanDeleteContents(user);
+	}
+
+	std::optional<Folder> FileObject::GetDirectory() const{
+		if(FilePath == "/"){
+			return std::nullopt;
+		}
+		char buffer[PATH_MAX + 1];
+		strncpy(buffer, FilePath.c_str(), PATH_MAX + 1);
+		return Folder(std::string(dirname(buffer)));
+	}
+
+	int FileObject::GetFileDescriptor() const{
+		return hFile;
+	}
+
+	std::string FileObject::GetFilePath() const{
+		return FilePath;
+	}
+
+	bool FileObject::GetFileExists() const{
+		return bFileExists;
+	}
+
+	std::optional<Permissions::Owner> FileObject::GetFileOwner(const Permissions::OwnerType type) const {
+		//left off here
+		if (!bFileExists) {
+			LOG_ERROR("Can't get owner of nonexistent file " << FilePath);
+			return std::nullopt;
+		}
+
+		if(type == Permissions::NONE){
+			LOG_ERROR("invalid owner type");
+			return std::nullopt;
+		}
+
+		struct stat statbuf;
+		if(fstat(hFile, &statbuf) < 0){
+			LOG_ERROR("Error stating file " << FilePath << ". errorno = " << errno);
+			return std::nullopt;
+		}
+
+		if(type == Permissions::USER){
+			return Permissions::User(statbuf.st_uid);
+		}else if(type == Permissions::GROUP){
+			return Permissions::Group(statbuf.st_gid);
+		}
+
+		return std::nullopt;
+	}
+
+	std::optional<FILETIME> FileObject::GetCreationTime() const {
+		if (!bFileExists) {
+			LOG_ERROR("Can't get creation time of " << FilePath << ", file doesn't exist");
+			errno = ENOENT;
+			return std::nullopt;
+		}
+		struct statx statbuf;
+		if (statx(hFile, NULL, AT_EMPTY_PATH, STATX_BTIME, &statbuf) == 0) {
+			return statbuf.stx_btime;
+		}else {
+			LOG_ERROR("Error getting creation time of " << FilePath << ". (Error: " << errno << ")");
+			return std::nullopt;
+		}
+	}
+
+	std::optional<FILETIME> FileObject::GetModifiedTime() const {
+		if (!bFileExists) {
+			LOG_ERROR("Can't get modification time of " << FilePath << ", file doesn't exist");
+			errno = ENOENT;
+			return std::nullopt;
+		}
+		struct statx statbuf;
+		if (statx(hFile, NULL, AT_EMPTY_PATH, STATX_MTIME, &statbuf) == 0) {
+			return statbuf.stx_mtime;
+		}else {
+			LOG_ERROR("Error getting modification time of " << FilePath << ". (Error: " << errno << ")");
+			return std::nullopt;
+		}
+	}
+
+	std::optional<FILETIME> FileObject::GetAccessTime() const {
+		if (!bFileExists) {
+			LOG_ERROR("Can't get access time of " << FilePath << ", file doesn't exist");
+			errno = ENOENT;
+			return std::nullopt;
+		}
+		struct statx statbuf;
+		if (statx(hFile, NULL, AT_EMPTY_PATH, STATX_ATIME, &statbuf) == 0) {
+			return statbuf.stx_atime;
+		}else {
+			LOG_ERROR("Error getting access time of " << FilePath << ". (Error: " << errno << ")");
+			return std::nullopt;
+		}
+	}
+
+	bool FileObject::GrantPermissions(const ACCESS_MASK amAccess) {
+		//return Permissions::UpdateObjectACL(FilePath, SE_FILE_OBJECT, owner, amAccess);
+		if(!bFileExists){
+			LOG_ERROR("Cant get permissions of nonexistant file " << FilePath << ".");
+		    return false;
+		}
+		std::optional<ACCESS_MASK> perms = this->GetPermissions();
+		if(!perms.has_value()){
+			return false;
+		}
+
+		return fchmod(hFile, perms.value() | amAccess) == 0;
+	}
+
+	bool FileObject::DenyPermissions(const ACCESS_MASK amAccess) 
+	{	
+		if(!bFileExists){
+			LOG_ERROR("Cant get permissions of nonexistant file " << FilePath << ".");
+		    return false;
+		}
+		std::optional<ACCESS_MASK> perms = this->GetPermissions();
+		if(!perms.has_value()){
+			return false;
+		}
+
+		return fchmod(hFile, perms.value() & ~amAccess) == 0;
+	}
+
+	bool FileObject::TakeOwnership() {
+		if(!bFileExists){
+			LOG_ERROR("Cant get permissions of nonexistant file " << FilePath << ".");
+		    return false;
+		}
 		std::optional<Permissions::Owner> BluespawnOwner = Permissions::GetProcessOwner();
 		if (BluespawnOwner == std::nullopt) {
 			return false;
 		}
-		return this->SetFolderOwner(*BluespawnOwner);
+		return this->SetFileOwner(*BluespawnOwner);
 	}
+
+
 }

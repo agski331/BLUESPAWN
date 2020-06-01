@@ -1,6 +1,6 @@
 #include "util/processes/ParseCobalt.h"
 
-#include <Windows.h>
+
 
 #include <optional>
 #include <map>

@@ -1,4 +1,4 @@
-#include <Windows.h>
+
 #include <Psapi.h>
 
 #include "hunt/hunts/HuntT1055.h"

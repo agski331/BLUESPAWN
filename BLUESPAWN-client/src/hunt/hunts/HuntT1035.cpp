@@ -12,7 +12,7 @@
 using namespace Registry;
 
 namespace Hunts {
-	HuntT1035::HuntT1035() : Hunt(L"T1035 - Service Execution") {
+	HuntT1035::HuntT1035() : Hunt("T1035 - Service Execution") {
 		dwSupportedScans = (DWORD) Aggressiveness::Normal;
 		dwCategoriesAffected = (DWORD) Category::Configurations | (DWORD) Category::Files | (DWORD) Category::Processes;
 		dwSourcesInvolved = (DWORD) DataSource::Registry | (DWORD) DataSource::FileSystem;

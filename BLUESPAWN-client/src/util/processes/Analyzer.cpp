@@ -1,4 +1,4 @@
-#include <Windows.h>
+
 #include <winternl.h>
 #include <tlhelp32.h>
 #include <DbgHelp.h>

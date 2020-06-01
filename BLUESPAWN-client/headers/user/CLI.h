@@ -11,7 +11,7 @@
  */
 class CLI : public IOBase {
 private:
-	HandleWrapper hMutex;
+	pthread_mutex_t hMutex;
 
 	/**
 	 * Creates a new CLI object with a given input and output handle.
@@ -37,7 +37,7 @@ public:
 	 *
 	 * @return The option that the user chose, or an empty wstring if no options were provided.
 	 */
-	virtual std::wstring GetUserSelection(const std::wstring& prompt, const std::vector<std::wstring>& options,
+	virtual std::string GetUserSelection(const std::string& prompt, const std::vector<std::string>& options,
 		DWORD dwMaximumDelay = -1, ImportanceLevel level = ImportanceLevel::LOW) const;
 
 	/**
@@ -45,7 +45,7 @@ public:
 	 *
 	 * @param information The message to be displayed to the user.
 	 */
-	virtual void InformUser(const std::wstring& information, ImportanceLevel level = ImportanceLevel::LOW) const;
+	virtual void InformUser(const std::string& information, ImportanceLevel level = ImportanceLevel::LOW) const;
 
 	/**
 	 * This method displays a message to the user. This will not return until the user acknowledges the message or
@@ -57,7 +57,7 @@ public:
 	 *
 	 * @return True if the user acknowledged the message, false otherwise.
 	 */
-	virtual bool AlertUser(const std::wstring& information, DWORD dwMaximumDelay = -1, ImportanceLevel level = ImportanceLevel::LOW) const;
+	virtual bool AlertUser(const std::string& information, DWORD dwMaximumDelay = -1, ImportanceLevel level = ImportanceLevel::LOW) const;
 
 	/**
 	 * This method displays a confirmation message to the user. This will display the prompt and three options:
@@ -71,9 +71,9 @@ public:
 	 * @return If a timeout occurs or the user chooses cancel, -1 will be returned. If the user responds no, 0 is
 	 * returned. If the user responds yes, 1 is returned.
 	 */
-	virtual DWORD GetUserConfirm(const std::wstring& prompt, DWORD dwMaximumDelay = -1, ImportanceLevel level = ImportanceLevel::LOW) const;
+	virtual DWORD GetUserConfirm(const std::string& prompt, DWORD dwMaximumDelay = -1, ImportanceLevel level = ImportanceLevel::LOW) const;
 
-	const HandleWrapper& GetMutex() const;
+	const pthread_mutex_t& GetMutex() const;
 };
 enum class MessageColor {
 	BLACK = 0x0,
